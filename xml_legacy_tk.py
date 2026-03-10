@@ -19,19 +19,20 @@ from tkinter import filedialog, messagebox, ttk
 import xml.etree.ElementTree as ET
 
 
-APP_TITLE = "Gerenciador de XML"
+APP_TITLE = "Gerenciador de XML v1"
 CONFIG_DIR_NAME = "CompactarXMLV4"
 CONFIG_FILE_NAME = "config.json"
-ICON_ICO_NAME = "xml_icon_multi.ico"
+ICON_ICO_NAME = "assets/xml_icon_final.ico"
 
 CNPJ_RE = re.compile(r"^\d{14}$")
 KEY_RE = re.compile(r"(?<!\d)(\d{44})(?!\d)")
-CTE_DIR_CANDIDATES = ("UniCTe", "UniCTE", "Unicte", "CTe", "CTE")
+CTE_DIR_CANDIDATES = ("cte", "CTe", "CTE", "UniCTe", "UniCTE", "Unicte")
 DANFE_INI_RELATIVE_PATH = Path("ControlGas") / "Ini" / "DANFE.ini"
 PASTA_UNINFE_LINE_RE = re.compile(r"^\s*PastaUniNFE\s*=\s*(.+?)\s*$", re.IGNORECASE)
 REMOTE_HOST_DRIVE_RE = re.compile(
     r"^\s*([A-Za-z0-9_.-]+)\s*:\s*([A-Za-z])\s*:[\\/](.*)\s*$"
 )
+DOC_TYPE_ORDER = {"NF-e": 0, "NFC-e": 1, "CT-e": 2}
 
 MONTH_NAMES_PT = (
     "janeiro",
@@ -346,24 +347,44 @@ def resolve_base_path(raw_value: str) -> Path:
     return path
 
 
-def discover_sources(base_dir: Path) -> List[Tuple[str, Path]]:
-    sources: List[Tuple[str, Path]] = []
+def find_cte_dir(cnpj_dir: Path) -> Optional[Path]:
+    for candidate in CTE_DIR_CANDIDATES:
+        cte_dir = cnpj_dir / candidate
+        if cte_dir.exists() and cte_dir.is_dir():
+            return cte_dir
+    return None
+
+
+def collect_scan_targets(base_dir: Path) -> Dict[str, List[Tuple[str, Path]]]:
+    targets: Dict[str, List[Tuple[str, Path]]] = {
+        "NF-e": [],
+        "NFC-e": [],
+        "CT-e": [],
+    }
 
     nfe_dir = base_dir / "UniNFe"
     if nfe_dir.exists():
-        sources.append(("NF-e", nfe_dir))
+        for cnpj_dir in find_cnpj_dirs(nfe_dir):
+            autorizados_dir = cnpj_dir / "Enviado" / "Autorizados"
+            if autorizados_dir.exists():
+                targets["NF-e"].append((cnpj_dir.name, autorizados_dir))
+
+            cte_dir = find_cte_dir(cnpj_dir)
+            if cte_dir is None:
+                continue
+
+            cte_autorizados_dir = cte_dir / "Enviado" / "Autorizados"
+            if cte_autorizados_dir.exists():
+                targets["CT-e"].append((cnpj_dir.name, cte_autorizados_dir))
 
     nfce_dir = base_dir / "Uninfce"
     if nfce_dir.exists():
-        sources.append(("NFC-e", nfce_dir))
+        for cnpj_dir in find_cnpj_dirs(nfce_dir):
+            autorizados_dir = cnpj_dir / "Enviado" / "Autorizados"
+            if autorizados_dir.exists():
+                targets["NFC-e"].append((cnpj_dir.name, autorizados_dir))
 
-    for candidate in CTE_DIR_CANDIDATES:
-        cte_dir = base_dir / candidate
-        if cte_dir.exists():
-            sources.append(("CT-e", cte_dir))
-            break
-
-    return sources
+    return targets
 
 
 def validate_structure(base_dir: Path) -> Tuple[bool, List[str]]:
@@ -379,15 +400,6 @@ def validate_structure(base_dir: Path) -> Tuple[bool, List[str]]:
         ("NF-e", base_dir / "UniNFe", True),
         ("NFC-e", base_dir / "Uninfce", True),
     ]
-
-    cte_path = None
-    for candidate in CTE_DIR_CANDIDATES:
-        check_path = base_dir / candidate
-        if check_path.exists():
-            cte_path = check_path
-            break
-    if cte_path is not None:
-        expected.append(("CT-e", cte_path, False))
 
     for doc_type, source_path, required in expected:
         if not source_path.exists():
@@ -427,6 +439,26 @@ def validate_structure(base_dir: Path) -> Tuple[bool, List[str]]:
                 f"[OK] {doc_type}: {len(cnpj_dirs)} CNPJ(s), {valid_autorizados} com Enviado/Autorizados."
             )
 
+    nfe_dir = base_dir / "UniNFe"
+    if nfe_dir.exists():
+        cte_count = 0
+        nfe_cnpjs = find_cnpj_dirs(nfe_dir)
+        for cnpj_dir in nfe_cnpjs:
+            cte_dir = find_cte_dir(cnpj_dir)
+            if cte_dir is None:
+                continue
+            if (cte_dir / "Enviado" / "Autorizados").exists():
+                cte_count += 1
+
+        if cte_count > 0:
+            lines.append(
+                f"[OK] CT-e: {cte_count} CNPJ(s) com cte/Enviado/Autorizados dentro de UniNFe."
+            )
+        elif nfe_cnpjs:
+            lines.append(
+                "[INFO] CT-e: nenhuma estrutura cte/Enviado/Autorizados encontrada dentro de UniNFe."
+            )
+
     if not lines:
         lines.append("[ERRO] Nenhuma pasta valida encontrada na raiz.")
 
@@ -462,22 +494,20 @@ def scan_notes(
         if progress_callback is not None:
             progress_callback(message)
 
-    for doc_type, source_dir in discover_sources(base_dir):
-        cnpj_dirs = find_cnpj_dirs(source_dir)
-        stats["cnpjs"] += len(cnpj_dirs)
-        notify(f"[{doc_type}] {len(cnpj_dirs)} CNPJ(s) encontrados.")
+    scan_targets = collect_scan_targets(base_dir)
 
-        for index, cnpj_dir in enumerate(cnpj_dirs, start=1):
-            autorizados_dir = cnpj_dir / "Enviado" / "Autorizados"
-            if not autorizados_dir.exists():
-                continue
+    for doc_type in sorted(scan_targets.keys(), key=lambda item: (DOC_TYPE_ORDER.get(item, 99), item)):
+        cnpj_targets = scan_targets[doc_type]
+        stats["cnpjs"] += len(cnpj_targets)
+        notify(f"[{doc_type}] {len(cnpj_targets)} CNPJ(s) encontrados.")
 
+        for index, (cnpj, autorizados_dir) in enumerate(cnpj_targets, start=1):
             search_roots = pick_search_roots(autorizados_dir, doc_type, full_tokens, short_tokens)
             if not search_roots:
                 continue
 
             notify(
-                f"[{doc_type}] CNPJ {cnpj_dir.name} ({index}/{len(cnpj_dirs)}) "
+                f"[{doc_type}] CNPJ {cnpj} ({index}/{len(cnpj_targets)}) "
                 f"- pastas do periodo: {len(search_roots)}"
             )
 
@@ -492,7 +522,7 @@ def scan_notes(
                     if stats["xml_lidos"] % 500 == 0:
                         notify(f"Lendo XMLs... {stats['xml_lidos']} arquivo(s) processados")
 
-                    note = parse_note_from_xml(xml_path, doc_type, cnpj_dir.name)
+                    note = parse_note_from_xml(xml_path, doc_type, cnpj)
                     if note is None:
                         continue
 
@@ -939,11 +969,14 @@ class XmlExplorerApp(tk.Tk):
         self.selected_note_ids: set[Tuple[str, str, str]] = set()
         self.visible_note_ids: set[Tuple[str, str, str]] = set()
         self.visible_cnpj_to_note_ids: Dict[str, set[Tuple[str, str, str]]] = {}
+        self.visible_doc_group_to_note_ids: Dict[Tuple[str, str], set[Tuple[str, str, str]]] = {}
         self.expanded_cnpjs: set[str] = set()
+        self.expanded_doc_groups: set[Tuple[str, str]] = set()
 
         self.item_to_note: Dict[str, NoteRecord] = {}
         self.context_note: Optional[NoteRecord] = None
         self.parent_item_to_cnpj: Dict[str, str] = {}
+        self.doc_group_item_to_key: Dict[str, Tuple[str, str]] = {}
 
         self.select_all_var = tk.IntVar(value=0)
         self.selection_count_var = tk.StringVar(value="0 marcado(s)")
@@ -1063,12 +1096,12 @@ class XmlExplorerApp(tk.Tk):
 
         grid_frame = ttk.LabelFrame(
             self.content_pane,
-            text="CNPJs e notas (checkbox para marcar, duplo clique para salvar uma nota)",
+            text="CNPJs, modelos e notas (checkbox para marcar, duplo clique para salvar uma nota)",
         )
 
         columns = ("sel", "tipo", "numero", "serie", "chave", "emissao")
         self.tree = ttk.Treeview(grid_frame, columns=columns, show="tree headings", height=20)
-        self.tree.heading("#0", text="CNPJ / Documento")
+        self.tree.heading("#0", text="CNPJ / Modelo / Documento")
         self.tree.heading("sel", text=self.UNCHECKED, command=self._toggle_select_all_from_header)
         self.tree.heading("tipo", text="Tipo")
         self.tree.heading("numero", text="Numero")
@@ -1446,14 +1479,25 @@ class XmlExplorerApp(tk.Tk):
             f"{len(self.all_notes)} nota(s) encontrada(s). {len(self.selected_note_ids)} marcada(s)."
         )
 
-    def _snapshot_expanded_cnpjs(self) -> None:
-        expanded: set[str] = set()
+    def _snapshot_expanded_tree_state(self) -> None:
+        expanded_cnpjs: set[str] = set()
+        expanded_doc_groups: set[Tuple[str, str]] = set()
+
         for parent_item in self.tree.get_children(""):
+            cnpj = self.parent_item_to_cnpj.get(parent_item)
+            if cnpj is None:
+                continue
+
             if self.tree.item(parent_item, "open"):
-                cnpj = self.parent_item_to_cnpj.get(parent_item)
-                if cnpj is not None:
-                    expanded.add(cnpj)
-        self.expanded_cnpjs = expanded
+                expanded_cnpjs.add(cnpj)
+
+            for group_item in self.tree.get_children(parent_item):
+                group_key = self.doc_group_item_to_key.get(group_item)
+                if group_key is not None and self.tree.item(group_item, "open"):
+                    expanded_doc_groups.add(group_key)
+
+        self.expanded_cnpjs = expanded_cnpjs
+        self.expanded_doc_groups = expanded_doc_groups
 
     def _filter_notes(self, notes: List[NoteRecord]) -> List[NoteRecord]:
         needle = self.filter_var.get().strip()
@@ -1463,7 +1507,7 @@ class XmlExplorerApp(tk.Tk):
         return [note for note in notes if needle in note.number]
 
     def _apply_filter_and_render(self) -> None:
-        self._snapshot_expanded_cnpjs()
+        self._snapshot_expanded_tree_state()
         filtered_notes = self._filter_notes(self.all_notes)
         self._render_tree(filtered_notes)
         self._update_selection_indicators()
@@ -1483,22 +1527,29 @@ class XmlExplorerApp(tk.Tk):
 
         self.item_to_note.clear()
         self.parent_item_to_cnpj.clear()
+        self.doc_group_item_to_key.clear()
         self.visible_cnpj_to_note_ids.clear()
+        self.visible_doc_group_to_note_ids.clear()
         self.visible_note_ids.clear()
 
-        grouped: Dict[str, List[NoteRecord]] = {}
+        grouped: Dict[str, Dict[str, List[NoteRecord]]] = {}
         for note in notes:
-            grouped.setdefault(note.cnpj, []).append(note)
+            grouped.setdefault(note.cnpj, {}).setdefault(note.doc_type, []).append(note)
 
-        for cnpj in sorted(grouped.keys()):
-            notes_by_cnpj = sorted(
-                grouped[cnpj],
+        def sort_notes(records: List[NoteRecord]) -> List[NoteRecord]:
+            return sorted(
+                records,
                 key=lambda r: (
                     r.issue_date or date.min,
-                    r.doc_type,
+                    DOC_TYPE_ORDER.get(r.doc_type, 99),
                     int(r.number) if r.number.isdigit() else 0,
                     r.key,
                 ),
+            )
+
+        for cnpj in sorted(grouped.keys()):
+            notes_by_cnpj = sort_notes(
+                [note for doc_notes in grouped[cnpj].values() for note in doc_notes]
             )
 
             cnpj_note_ids = {self._note_id(note) for note in notes_by_cnpj}
@@ -1514,35 +1565,60 @@ class XmlExplorerApp(tk.Tk):
             )
             self.parent_item_to_cnpj[parent_item] = cnpj
 
-            for note in notes_by_cnpj:
-                note_id = self._note_id(note)
-                issue_text = note.issue_date.isoformat() if note.issue_date else "-"
-                child_item = self.tree.insert(
+            for doc_type in sorted(grouped[cnpj].keys(), key=lambda item: (DOC_TYPE_ORDER.get(item, 99), item)):
+                notes_by_doc_type = sort_notes(grouped[cnpj][doc_type])
+                doc_group_key = (cnpj, doc_type)
+                doc_group_note_ids = {self._note_id(note) for note in notes_by_doc_type}
+                self.visible_doc_group_to_note_ids[doc_group_key] = doc_group_note_ids
+
+                group_item = self.tree.insert(
                     parent_item,
                     "end",
-                    text=f"{note.doc_type} {note.number}",
-                    values=(
-                        self.CHECKED if note_id in self.selected_note_ids else self.UNCHECKED,
-                        note.doc_type,
-                        note.number,
-                        note.series,
-                        note.key,
-                        issue_text,
-                    ),
+                    text=f"{doc_type} ({len(notes_by_doc_type)} nota(s))",
+                    values=(self._checkbox_marker(doc_group_note_ids), doc_type, "", "", "", ""),
+                    open=(doc_group_key in self.expanded_doc_groups),
                 )
-                self.item_to_note[child_item] = note
+                self.doc_group_item_to_key[group_item] = doc_group_key
+
+                for note in notes_by_doc_type:
+                    note_id = self._note_id(note)
+                    issue_text = note.issue_date.isoformat() if note.issue_date else "-"
+                    child_item = self.tree.insert(
+                        group_item,
+                        "end",
+                        text=f"Documento {note.number}",
+                        values=(
+                            self.CHECKED if note_id in self.selected_note_ids else self.UNCHECKED,
+                            note.doc_type,
+                            note.number,
+                            note.series,
+                            note.key,
+                            issue_text,
+                        ),
+                    )
+                    self.item_to_note[child_item] = note
 
     def _on_tree_open(self, _event: tk.Event) -> None:
         item_id = self.tree.focus()
         cnpj = self.parent_item_to_cnpj.get(item_id)
         if cnpj is not None:
             self.expanded_cnpjs.add(cnpj)
+            return
+
+        doc_group_key = self.doc_group_item_to_key.get(item_id)
+        if doc_group_key is not None:
+            self.expanded_doc_groups.add(doc_group_key)
 
     def _on_tree_close(self, _event: tk.Event) -> None:
         item_id = self.tree.focus()
         cnpj = self.parent_item_to_cnpj.get(item_id)
         if cnpj is not None:
             self.expanded_cnpjs.discard(cnpj)
+            return
+
+        doc_group_key = self.doc_group_item_to_key.get(item_id)
+        if doc_group_key is not None:
+            self.expanded_doc_groups.discard(doc_group_key)
 
     def _on_tree_right_click(self, event: tk.Event) -> None:
         row_id = self.tree.identify_row(event.y)
@@ -1592,6 +1668,18 @@ class XmlExplorerApp(tk.Tk):
         cnpj = self.parent_item_to_cnpj.get(row_id)
         if cnpj is not None:
             note_ids = self.visible_cnpj_to_note_ids.get(cnpj, set())
+            if not note_ids:
+                return
+            if note_ids.issubset(self.selected_note_ids):
+                self.selected_note_ids.difference_update(note_ids)
+            else:
+                self.selected_note_ids.update(note_ids)
+            self._apply_filter_and_render()
+            return
+
+        doc_group_key = self.doc_group_item_to_key.get(row_id)
+        if doc_group_key is not None:
+            note_ids = self.visible_doc_group_to_note_ids.get(doc_group_key, set())
             if not note_ids:
                 return
             if note_ids.issubset(self.selected_note_ids):
