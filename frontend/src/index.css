@@ -1,0 +1,242 @@
+﻿@import "tailwindcss";
+@import "react-day-picker/style.css";
+
+:root {
+  color: #e2e8f0;
+  background-color: #020817;
+  font-family: "Segoe UI Variable Text", "Aptos", "Trebuchet MS", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  background: #020817;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top, rgba(56, 189, 248, 0.12), transparent 28%),
+    linear-gradient(180deg, #020617 0%, #020817 100%);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+::selection {
+  background: rgba(34, 211, 238, 0.3);
+  color: #f8fafc;
+}
+
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.75);
+}
+
+::-webkit-scrollbar-thumb {
+  border: 3px solid rgba(15, 23, 42, 0.75);
+  border-radius: 999px;
+  background: rgba(100, 116, 139, 0.85);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.95);
+}
+
+.rdp-root {
+  --rdp-accent-color: rgb(34 211 238);
+  --rdp-accent-background-color: rgba(34, 211, 238, 0.12);
+  --rdp-day_button-border-radius: 18px;
+  --rdp-day-height: 44px;
+  --rdp-day-width: 44px;
+  --rdp-nav_button-height: 36px;
+  --rdp-nav_button-width: 36px;
+}
+
+@keyframes collapsible-down {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes collapsible-up {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  to {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+}
+
+.collapsible-panel[data-state='open'] {
+  animation: collapsible-down 180ms ease-out;
+}
+
+.collapsible-panel[data-state='closed'] {
+  animation: collapsible-up 140ms ease-in;
+}
+
+
+.intro-loader {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  --loader-color: hsl(199 89% 88%);
+  --loader-animation: 2s ease-in-out infinite;
+}
+
+.intro-loader__circle {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  margin: 0 10px;
+  border: solid 2px var(--loader-color);
+  border-radius: 999px;
+  background: transparent;
+  animation: intro-loader-circle var(--loader-animation);
+}
+
+.intro-loader__dot {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 16px;
+  height: 16px;
+  transform: translate(-50%, -50%);
+  border-radius: 999px;
+  background: var(--loader-color);
+  animation: intro-loader-dot var(--loader-animation);
+}
+
+.intro-loader__outline {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 20px;
+  height: 20px;
+  transform: translate(-50%, -50%);
+  border-radius: 999px;
+  animation: intro-loader-outline var(--loader-animation);
+}
+
+.intro-loader__circle:nth-child(2) {
+  animation-delay: 0.3s;
+}
+
+.intro-loader__circle:nth-child(3) {
+  animation-delay: 0.6s;
+}
+
+.intro-loader__circle:nth-child(4) {
+  animation-delay: 0.9s;
+}
+
+.intro-loader__circle:nth-child(2) .intro-loader__dot {
+  animation-delay: 0.3s;
+}
+
+.intro-loader__circle:nth-child(3) .intro-loader__dot {
+  animation-delay: 0.6s;
+}
+
+.intro-loader__circle:nth-child(4) .intro-loader__dot {
+  animation-delay: 0.9s;
+}
+
+.intro-loader__circle:nth-child(1) .intro-loader__outline {
+  animation-delay: 0.9s;
+}
+
+.intro-loader__circle:nth-child(2) .intro-loader__outline {
+  animation-delay: 1.2s;
+}
+
+.intro-loader__circle:nth-child(3) .intro-loader__outline {
+  animation-delay: 1.5s;
+}
+
+.intro-loader__circle:nth-child(4) .intro-loader__outline {
+  animation-delay: 1.8s;
+}
+
+@keyframes intro-loader-circle {
+  0% {
+    transform: scale(1);
+    opacity: 1;
+  }
+
+  50% {
+    transform: scale(1.5);
+    opacity: 0.5;
+  }
+
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes intro-loader-dot {
+  0% {
+    transform: translate(-50%, -50%) scale(1);
+  }
+
+  50% {
+    transform: translate(-50%, -50%) scale(0);
+  }
+
+  100% {
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+@keyframes intro-loader-outline {
+  0% {
+    transform: translate(-50%, -50%) scale(0);
+    outline: solid 20px var(--loader-color);
+    outline-offset: 0;
+    opacity: 1;
+  }
+
+  100% {
+    transform: translate(-50%, -50%) scale(1);
+    outline: solid 0 transparent;
+    outline-offset: 20px;
+    opacity: 0;
+  }
+}
