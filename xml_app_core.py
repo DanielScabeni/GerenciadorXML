@@ -63,6 +63,10 @@ class ScanJob:
     job_id: str
     status: str = "running"
     progress_text: str = "Preparando leitura..."
+    period: Dict[str, str] = field(default_factory=lambda: {
+        "startDate": "",
+        "endDate": "",
+    })
     logs: List[str] = field(default_factory=list)
     stats: Dict[str, int] = field(default_factory=lambda: {
         "cnpjs": 0,
@@ -81,6 +85,7 @@ class ScanJob:
             "jobId": self.job_id,
             "status": self.status,
             "progressText": self.progress_text,
+            "period": dict(self.period),
             "logs": list(self.logs),
             "stats": dict(self.stats),
             "notes": list(self.notes),
@@ -835,12 +840,37 @@ def build_default_zip_name(start_date: date, end_date: date) -> str:
     return f"{format_period_for_zip_name(start_date, end_date)}.zip"
 
 
+def format_xml_preview(source: Path) -> str:
+    try:
+        tree = ET.parse(source)
+        ET.indent(tree, space="  ")
+        root = tree.getroot()
+        return ET.tostring(root, encoding="unicode")
+    except ET.ParseError:
+        for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+            try:
+                return source.read_text(encoding=encoding)
+            except UnicodeDecodeError:
+                continue
+        return source.read_text(encoding="utf-8", errors="replace")
+
+
 class XmlAppService:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self.config_data = load_config()
         self.note_by_id: Dict[str, NoteRecord] = {}
         self.jobs: Dict[str, ScanJob] = {}
+
+    def _last_search_payload(self) -> Optional[Dict[str, str]]:
+        start_date = self.config_data.get("last_search_start_date", "").strip()
+        end_date = self.config_data.get("last_search_end_date", "").strip()
+        if not start_date or not end_date:
+            return None
+        return {
+            "startDate": start_date,
+            "endDate": end_date,
+        }
 
     def get_initial_state(self) -> Dict[str, object]:
         saved_path = self.config_data.get("base_path", "").strip()
@@ -868,6 +898,7 @@ class XmlAppService:
             },
             "startup": startup,
             "validation": None,
+            "lastSearch": self._last_search_payload(),
         }
 
     def load_startup_context(self) -> Dict[str, object]:
@@ -887,6 +918,7 @@ class XmlAppService:
             },
             "startup": startup,
             "validation": validation,
+            "lastSearch": self._last_search_payload(),
         }
 
     def _build_startup_payload(self, saved_path: str) -> Dict[str, object]:
@@ -1030,7 +1062,14 @@ class XmlAppService:
             self.config_data["base_path"] = str(resolved)
             save_config(self.config_data)
             job_id = uuid4().hex
-            job = ScanJob(job_id=job_id, progress_text="Preparando busca...")
+            job = ScanJob(
+                job_id=job_id,
+                progress_text="Preparando busca...",
+                period={
+                    "startDate": start_date.isoformat(),
+                    "endDate": end_date.isoformat(),
+                },
+            )
             job.logs.append(f"[INFO] Busca iniciada em {resolved}")
             self.jobs[job_id] = job
 
@@ -1067,6 +1106,9 @@ class XmlAppService:
                 job.progress_text = f"Busca concluida. {len(notes)} nota(s) encontrada(s)."
                 job.stats = stats
                 job.notes = serialized_notes
+                self.config_data["last_search_start_date"] = start_date.isoformat()
+                self.config_data["last_search_end_date"] = end_date.isoformat()
+                save_config(self.config_data)
                 job.logs.append("-" * 80)
                 job.logs.append(f"Busca concluida: {start_date.isoformat()} ate {end_date.isoformat()}")
                 job.logs.append(f"CNPJs analisados: {stats['cnpjs']}")
@@ -1190,6 +1232,27 @@ class XmlAppService:
             return {"ok": False, "message": f"Nao foi possivel abrir o local do arquivo: {exc}"}
 
         return {"ok": True, "message": "Local do arquivo aberto."}
+
+    def get_note_xml_preview(self, note_id: str) -> Dict[str, object]:
+        note = self.note_by_id.get(note_id)
+        if note is None:
+            return {"ok": False, "message": "Nota nao encontrada na busca atual."}
+
+        source = note.file_path
+        if not source.exists():
+            return {"ok": False, "message": f"Arquivo nao encontrado: {source}"}
+
+        try:
+            xml_text = format_xml_preview(source)
+        except Exception as exc:
+            return {"ok": False, "message": f"Nao foi possivel carregar o XML: {exc}"}
+
+        return {
+            "ok": True,
+            "message": "XML carregado para visualizacao.",
+            "fileName": source.name,
+            "xmlText": xml_text,
+        }
 
     def default_zip_name(self, start_date_text: str, end_date_text: str) -> str:
         try:

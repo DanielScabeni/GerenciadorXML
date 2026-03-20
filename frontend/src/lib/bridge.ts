@@ -1,10 +1,11 @@
-﻿import type {
+import type {
   ActionResult,
   BackendNote,
   ChoosePathResult,
   DesktopBridge,
   DetectionResult,
   InitialState,
+  NotePreviewResult,
   SaveConfigResult,
   SaveZipRequest,
   SaveZipResult,
@@ -60,6 +61,7 @@ const mockNotes: BackendNote[] = [
 ]
 
 let mockBasePath = 'C:\\Unimake'
+let mockLastSearch: { startDate: string; endDate: string } | null = null
 let mockJob: ScanJobSnapshot | null = null
 let cachedBridge: Promise<DesktopBridge> | null = null
 
@@ -92,6 +94,7 @@ async function createDesktopBridge(): Promise<DesktopBridge> {
       saveSelectedZip: (request: SaveZipRequest) => callApi<SaveZipResult>(pywebviewApi, 'save_selected_zip', request),
       saveNoteCopy: (noteId: string) => callApi<ActionResult>(pywebviewApi, 'save_note_copy', noteId),
       openNoteLocation: (noteId: string) => callApi<ActionResult>(pywebviewApi, 'open_note_location', noteId),
+      getNoteXmlPreview: (noteId: string) => callApi<NotePreviewResult>(pywebviewApi, 'get_note_xml_preview', noteId),
     }
   }
 
@@ -213,6 +216,7 @@ function createMockBridge(): DesktopBridge {
           lines: [],
         },
         validation: null,
+        lastSearch: mockLastSearch,
       }
     },
     async loadStartupContext() {
@@ -236,6 +240,7 @@ function createMockBridge(): DesktopBridge {
           message: 'Estrutura simulada validada.',
           lines: ['[OK] Estrutura simulada pronta para desenvolvimento.'],
         },
+        lastSearch: mockLastSearch,
       }
     },
     async chooseBasePath() {
@@ -288,6 +293,10 @@ function createMockBridge(): DesktopBridge {
         jobId,
         status: 'running',
         progressText: 'Preparando busca simulada...',
+        period: {
+          startDate: request.startDate,
+          endDate: request.endDate,
+        },
         logs: [`[INFO] Busca simulada iniciada em ${request.basePath}`],
         stats: {
           cnpjs: 0,
@@ -304,6 +313,11 @@ function createMockBridge(): DesktopBridge {
       window.setTimeout(() => {
         if (!mockJob || mockJob.jobId !== jobId) {
           return
+        }
+
+        mockLastSearch = {
+          startDate: request.startDate,
+          endDate: request.endDate,
         }
 
         mockJob = {
@@ -357,6 +371,33 @@ function createMockBridge(): DesktopBridge {
         message: 'Modo demonstracao: local do arquivo aberto de forma simulada.',
       }
     },
+    async getNoteXmlPreview(noteId: string) {
+      const note = mockNotes.find((item) => item.id === noteId)
+      if (!note) {
+        return {
+          ok: false,
+          message: 'Nota simulada nao encontrada.',
+        }
+      }
+
+      const xmlText = [
+        '<?xml version="1.0" encoding="utf-8"?>',
+        `<documento tipo="${note.docType}">`,
+        `  <cnpj>${note.cnpj}</cnpj>`,
+        `  <numero>${note.number}</numero>`,
+        `  <serie>${note.series}</serie>`,
+        `  <chave>${note.accessKey}</chave>`,
+        `  <arquivo>${note.fileName}</arquivo>`,
+        '</documento>',
+      ].join('\\n')
+
+      return {
+        ok: true,
+        message: 'XML simulado carregado.',
+        fileName: note.fileName,
+        xmlText,
+      }
+    },
   }
 }
 
@@ -378,4 +419,5 @@ function formatDateForBridge(date: Date) {
   const day = `${date.getDate()}`.padStart(2, '0')
   return `${year}-${month}-${day}`
 }
+
 

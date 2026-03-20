@@ -147,6 +147,9 @@ class WebviewApi:
     def open_note_location(self, note_id: str) -> Dict[str, object]:
         return self.service.open_note_location(note_id)
 
+    def get_note_xml_preview(self, note_id: str) -> Dict[str, object]:
+        return self.service.get_note_xml_preview(note_id)
+
 
 def _first_dialog_result(result: Any) -> str:
     if not result:
@@ -178,6 +181,7 @@ def _expose_window_api(window: webview.Window, api: WebviewApi) -> None:
         api.save_selected_zip,
         api.save_note_copy,
         api.open_note_location,
+        api.get_note_xml_preview,
     )
 
 
@@ -211,7 +215,17 @@ def main() -> None:
 
     api.bind_window(window)
     _expose_window_api(window, api)
+
+    def maximize_on_start() -> None:
+        maximize = getattr(window, 'maximize', None)
+        if callable(maximize):
+            try:
+                maximize()
+            except Exception:
+                pass
+
     webview.start(
+        maximize_on_start,
         debug=False,
         http_server=True,
         private_mode=True,

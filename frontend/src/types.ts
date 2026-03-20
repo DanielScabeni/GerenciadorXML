@@ -24,6 +24,11 @@ export type StartupState = {
   source?: 'danfe' | 'default-search' | 'manual'
 }
 
+export type LastSearchState = {
+  startDate: string
+  endDate: string
+} | null
+
 export type InitialState = {
   ok: boolean
   appTitle: string
@@ -34,6 +39,7 @@ export type InitialState = {
   }
   startup: StartupState
   validation: ValidationResult | null
+  lastSearch: LastSearchState
 }
 
 export type StartupContextResult = {
@@ -41,6 +47,7 @@ export type StartupContextResult = {
   config: ConfigState
   startup: StartupState
   validation: ValidationResult | null
+  lastSearch: LastSearchState
 }
 
 export type ValidationResult = {
@@ -89,6 +96,10 @@ export type ScanJobSnapshot = {
   jobId: string
   status: 'running' | 'completed' | 'error'
   progressText: string
+  period: {
+    startDate: string
+    endDate: string
+  }
   logs: string[]
   stats: {
     cnpjs: number
@@ -124,6 +135,13 @@ export type ActionResult = {
   targetPath?: string
 }
 
+export type NotePreviewResult = {
+  ok: boolean
+  message: string
+  fileName?: string
+  xmlText?: string
+}
+
 export type DesktopBridge = {
   getInitialState: () => Promise<InitialState>
   loadStartupContext: () => Promise<StartupContextResult>
@@ -137,4 +155,5 @@ export type DesktopBridge = {
   saveSelectedZip: (request: SaveZipRequest) => Promise<SaveZipResult>
   saveNoteCopy: (noteId: string) => Promise<ActionResult>
   openNoteLocation: (noteId: string) => Promise<ActionResult>
+  getNoteXmlPreview: (noteId: string) => Promise<NotePreviewResult>
 }

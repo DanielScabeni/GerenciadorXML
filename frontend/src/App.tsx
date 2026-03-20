@@ -37,6 +37,7 @@ import type {
   DesktopBridge,
   DetectionResult,
   InitialState,
+  LastSearchState,
   ScanJobSnapshot,
   StartupState,
   ValidationResult,
@@ -52,6 +53,11 @@ type ModelGroup = {
   id: string
   label: string
   notes: BackendNote[]
+}
+
+type NotePreviewCache = {
+  fileName: string
+  xmlText: string
 }
 
 type NoticeTone = 'info' | 'success' | 'error'
@@ -79,12 +85,18 @@ function App() {
 
   const [configPath, setConfigPath] = useState('')
   const [period, setPeriod] = useState<DateRange | undefined>(createPreviousMonthRange(new Date()))
+  const [lastSearchPeriod, setLastSearchPeriod] = useState<DateRange | null>(null)
   const [documentFilter, setDocumentFilter] = useState('')
 
   const [notes, setNotes] = useState<BackendNote[]>([])
   const [selectedNoteIds, setSelectedNoteIds] = useState<Set<string>>(new Set())
   const [expandedCompanies, setExpandedCompanies] = useState<Set<string>>(new Set())
   const [expandedModels, setExpandedModels] = useState<Set<string>>(new Set())
+  const [expandedNotePreviews, setExpandedNotePreviews] = useState<Set<string>>(new Set())
+  const [loadingCompanyIds, setLoadingCompanyIds] = useState<Set<string>>(new Set())
+  const [loadingModelIds, setLoadingModelIds] = useState<Set<string>>(new Set())
+  const [loadingPreviewIds, setLoadingPreviewIds] = useState<Set<string>>(new Set())
+  const [notePreviewById, setNotePreviewById] = useState<Record<string, NotePreviewCache>>({})
 
   const [configOpen, setConfigOpen] = useState(false)
   const [activityOpen, setActivityOpen] = useState(true)
@@ -106,6 +118,8 @@ function App() {
 
   const lastLogCountRef = useRef<Record<string, number>>({})
   const bridgeRetryRef = useRef(0)
+  const toggleLoadTimersRef = useRef<Record<string, number>>({})
+  const previewGenerationRef = useRef(0)
 
   const appendLogs = useCallback((lines: string[]) => {
     if (lines.length === 0) {
@@ -121,6 +135,30 @@ function App() {
       message: 'O backend nativo ainda esta terminando de iniciar. Tente novamente em alguns instantes.',
     })
   }, [])
+
+  const clearToggleTimer = useCallback((key: string) => {
+    const timerId = toggleLoadTimersRef.current[key]
+    if (timerId === undefined) {
+      return
+    }
+
+    window.clearTimeout(timerId)
+    delete toggleLoadTimersRef.current[key]
+  }, [])
+
+  const clearAllToggleTimers = useCallback(() => {
+    Object.keys(toggleLoadTimersRef.current).forEach((key) => {
+      const timerId = toggleLoadTimersRef.current[key]
+      window.clearTimeout(timerId)
+      delete toggleLoadTimersRef.current[key]
+    })
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      clearAllToggleTimers()
+    }
+  }, [clearAllToggleTimers])
   useEffect(() => {
     let active = true
     let retryTimer = 0
@@ -139,6 +177,7 @@ function App() {
       })
       setStartupInfo(state.startup)
       setValidationResult(state.validation)
+      setLastSearchPeriod(parseLastSearchRange(state.lastSearch))
       setConfigLines(trimLogs([...state.startup.lines, ...(state.validation?.lines ?? [])]))
 
       const initialLines = [...state.startup.lines, ...(state.validation?.lines ?? [])]
@@ -155,6 +194,7 @@ function App() {
     const applyStartupContext = (state: Awaited<ReturnType<DesktopBridge['loadStartupContext']>>) => {
       setStartupInfo(state.startup)
       setValidationResult(state.validation)
+      setLastSearchPeriod((current) => current ?? parseLastSearchRange(state.lastSearch))
       setConfigPath((current) => current.trim() || state.config.basePath || state.startup.path || '')
 
       const contextLines = trimLogs([...state.startup.lines, ...(state.validation?.lines ?? [])])
@@ -314,14 +354,19 @@ function App() {
 
         const nextNotes = result.notes
         setNotes(nextNotes)
-        setSelectedNoteIds((current) => {
-          const validIds = new Set(nextNotes.map((note) => note.id))
-          return new Set([...current].filter((noteId) => validIds.has(noteId)))
-        })
+        setSelectedNoteIds(new Set(nextNotes.map((note) => note.id)))
+        setLastSearchPeriod(parseLastSearchRange(result.period))
 
-        const defaults = buildExpansionDefaults(nextNotes)
+        const defaults = buildExpansionDefaults()
+        previewGenerationRef.current += 1
+        clearAllToggleTimers()
         setExpandedCompanies(defaults.companyIds)
         setExpandedModels(defaults.modelIds)
+        setExpandedNotePreviews(new Set())
+        setLoadingCompanyIds(new Set())
+        setLoadingModelIds(new Set())
+        setLoadingPreviewIds(new Set())
+        setNotePreviewById({})
         setBusyAction(null)
         setScanJobId('')
         setNotice({
@@ -351,7 +396,7 @@ function App() {
       active = false
       window.clearInterval(timer)
     }
-  }, [appendLogs, bridge, scanJobId])
+  }, [appendLogs, bridge, clearAllToggleTimers, scanJobId])
 
   useEffect(() => {
     if (!contextMenu) {
@@ -417,6 +462,7 @@ function App() {
 
   const isScanRunning = scanSnapshot?.status === 'running' || busyAction === 'scan'
   const canSaveZip = selectedNoteIds.size > 0 && !isScanRunning && !!bridge
+  const zipPeriod = lastSearchPeriod?.from && lastSearchPeriod?.to ? lastSearchPeriod : period
 
   const selectionSummary = useMemo(() => {
     if (stats.selectedTotal === 0) {
@@ -429,6 +475,8 @@ function App() {
 
     return `${stats.selectedVisible} visivel(is) marcados de ${stats.selectedTotal} no total.`
   }, [stats.selectedTotal, stats.selectedVisible])
+
+  const lastSearchSummary = useMemo(() => formatLastSearchRange(lastSearchPeriod), [lastSearchPeriod])
 
   const statusMessage = isScanRunning && scanSnapshot?.progressText ? scanSnapshot.progressText : notice.message
 
@@ -639,7 +687,7 @@ function App() {
   }
 
   const handleSaveZip = async () => {
-    if (!bridge || !period?.from || !period?.to || selectedNoteIds.size === 0) {
+    if (!bridge || !zipPeriod?.from || !zipPeriod?.to || selectedNoteIds.size === 0) {
       if (!bridge) {
         notifyBackendPending()
       }
@@ -650,8 +698,8 @@ function App() {
     try {
       const result = await bridge.saveSelectedZip({
         noteIds: [...selectedNoteIds],
-        startDate: formatIsoDate(period.from),
-        endDate: formatIsoDate(period.to),
+        startDate: formatIsoDate(zipPeriod.from),
+        endDate: formatIsoDate(zipPeriod.to),
       })
 
       if (!result.ok) {
@@ -733,6 +781,110 @@ function App() {
       setContextMenu(null)
     }
   }
+
+  const handleCompanyToggle = useCallback((companyId: string) => {
+    const timerKey = `company:${companyId}`
+
+    if (expandedCompanies.has(companyId)) {
+      clearToggleTimer(timerKey)
+      setLoadingCompanyIds((current) => removeSetValue(current, companyId))
+      setExpandedCompanies((current) => removeSetValue(current, companyId))
+      return
+    }
+
+    if (loadingCompanyIds.has(companyId)) {
+      return
+    }
+
+    setLoadingCompanyIds((current) => addSetValue(current, companyId))
+    clearToggleTimer(timerKey)
+    toggleLoadTimersRef.current[timerKey] = window.setTimeout(() => {
+      delete toggleLoadTimersRef.current[timerKey]
+      setLoadingCompanyIds((current) => removeSetValue(current, companyId))
+      setExpandedCompanies((current) => addSetValue(current, companyId))
+    }, 180)
+  }, [clearToggleTimer, expandedCompanies, loadingCompanyIds])
+
+  const handleModelToggle = useCallback((modelId: string) => {
+    const timerKey = `model:${modelId}`
+
+    if (expandedModels.has(modelId)) {
+      clearToggleTimer(timerKey)
+      setLoadingModelIds((current) => removeSetValue(current, modelId))
+      setExpandedModels((current) => removeSetValue(current, modelId))
+      return
+    }
+
+    if (loadingModelIds.has(modelId)) {
+      return
+    }
+
+    setLoadingModelIds((current) => addSetValue(current, modelId))
+    clearToggleTimer(timerKey)
+    toggleLoadTimersRef.current[timerKey] = window.setTimeout(() => {
+      delete toggleLoadTimersRef.current[timerKey]
+      setLoadingModelIds((current) => removeSetValue(current, modelId))
+      setExpandedModels((current) => addSetValue(current, modelId))
+    }, 180)
+  }, [clearToggleTimer, expandedModels, loadingModelIds])
+
+  const handleNotePreviewToggle = useCallback(async (noteId: string) => {
+    if (expandedNotePreviews.has(noteId)) {
+      setExpandedNotePreviews((current) => removeSetValue(current, noteId))
+      return
+    }
+
+    if (loadingPreviewIds.has(noteId)) {
+      return
+    }
+
+    const cachedPreview = notePreviewById[noteId]
+    if (cachedPreview) {
+      setExpandedNotePreviews((current) => addSetValue(current, noteId))
+      return
+    }
+
+    if (!bridge) {
+      notifyBackendPending()
+      return
+    }
+
+    const requestGeneration = previewGenerationRef.current
+    setLoadingPreviewIds((current) => addSetValue(current, noteId))
+
+    try {
+      const result = await bridge.getNoteXmlPreview(noteId)
+      if (previewGenerationRef.current !== requestGeneration) {
+        return
+      }
+
+      if (!result.ok || !result.xmlText) {
+        setNotice({ tone: 'error', message: result.message })
+        appendLogs([`[ERRO] ${result.message}`])
+        return
+      }
+
+      const xmlText = result.xmlText
+      setNotePreviewById((current) => ({
+        ...current,
+        [noteId]: {
+          fileName: result.fileName || 'XML',
+          xmlText,
+        },
+      }))
+      setExpandedNotePreviews((current) => addSetValue(current, noteId))
+    } catch (error) {
+      if (previewGenerationRef.current !== requestGeneration) {
+        return
+      }
+
+      const message = error instanceof Error ? error.message : 'Falha ao carregar o XML para visualizacao.'
+      setNotice({ tone: 'error', message })
+      appendLogs([`[ERRO] ${message}`])
+    } finally {
+      setLoadingPreviewIds((current) => removeSetValue(current, noteId))
+    }
+  }, [appendLogs, bridge, expandedNotePreviews, loadingPreviewIds, notePreviewById, notifyBackendPending])
 
   const handleToggleAllVisible = (checked: boolean) => {
     setSelectedNoteIds((current) => {
@@ -882,7 +1034,7 @@ function App() {
                   </div>
                 </div>
                 <InfoPill label="Selecao" value={selectionSummary} />
-                <InfoPill label="Periodo ativo" value={formatRange(period)} />
+                <InfoPill label="Periodo selecionado" value={lastSearchSummary} />
               </div>
               <div className="mt-4">
                 <NoticeCard tone={notice.tone} message={statusMessage} />
@@ -933,18 +1085,20 @@ function App() {
                     const companyNoteIds = company.models.flatMap((model) => model.notes.map((note) => note.id))
                     const companyState = deriveCheckedState(companyNoteIds, selectedNoteIds)
                     const companyOpen = expandedCompanies.has(company.id)
+                    const companyLoading = loadingCompanyIds.has(company.id)
 
                     return (
-                      <Collapsible.Root key={company.id} open={companyOpen} onOpenChange={() => setExpandedCompanies((current) => toggleSetValue(current, company.id))}>
+                      <Collapsible.Root key={company.id} open={companyOpen} onOpenChange={() => handleCompanyToggle(company.id)}>
                         <div className="rounded-[28px] border border-white/10 bg-white/[0.03] shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
                           <div className="flex items-center gap-3 px-4 py-4 sm:px-5">
                             <Collapsible.Trigger asChild>
                               <button
                                 type="button"
+                                aria-busy={companyLoading}
                                 className="flex min-w-0 flex-1 items-center gap-4 rounded-2xl text-left outline-none transition hover:bg-white/[0.04] focus-visible:ring-2 focus-visible:ring-cyan-300/70"
                               >
                                 <span className="flex size-10 shrink-0 items-center justify-center rounded-2xl border border-cyan-300/20 bg-cyan-400/10 text-cyan-100">
-                                  {companyOpen ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
+                                  {companyLoading ? <InlineLoader compact /> : companyOpen ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
                                 </span>
                                 <span className="min-w-0 flex-1">
                                   <span className="flex flex-wrap items-center gap-3">
@@ -956,7 +1110,9 @@ function App() {
                                       {companyNoteIds.length} XMLs
                                     </span>
                                   </span>
-                                  <span className="mt-1 block text-sm text-slate-400">Selecione o CNPJ inteiro ou refine pelo modelo abaixo.</span>
+                                  <span className="mt-1 block text-sm text-slate-400">
+                                    {companyLoading ? 'Preparando modelos e notas deste CNPJ...' : 'Selecione o CNPJ inteiro ou refine pelo modelo abaixo.'}
+                                  </span>
                                 </span>
                               </button>
                             </Collapsible.Trigger>
@@ -970,25 +1126,29 @@ function App() {
                                 const modelNoteIds = model.notes.map((note) => note.id)
                                 const modelState = deriveCheckedState(modelNoteIds, selectedNoteIds)
                                 const modelOpen = expandedModels.has(model.id)
+                                const modelLoading = loadingModelIds.has(model.id)
 
                                 return (
-                                  <Collapsible.Root key={model.id} open={modelOpen} onOpenChange={() => setExpandedModels((current) => toggleSetValue(current, model.id))}>
+                                  <Collapsible.Root key={model.id} open={modelOpen} onOpenChange={() => handleModelToggle(model.id)}>
                                     <div className="rounded-[24px] border border-white/8 bg-slate-950/52">
                                       <div className="flex items-center gap-3 px-4 py-3.5">
                                         <Collapsible.Trigger asChild>
                                           <button
                                             type="button"
+                                            aria-busy={modelLoading}
                                             className="flex min-w-0 flex-1 items-center gap-4 rounded-2xl text-left outline-none transition hover:bg-white/[0.03] focus-visible:ring-2 focus-visible:ring-cyan-300/70"
                                           >
                                             <span className="flex size-9 shrink-0 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04] text-slate-200">
-                                              {modelOpen ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
+                                              {modelLoading ? <InlineLoader compact /> : modelOpen ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
                                             </span>
                                             <span className="min-w-0 flex-1">
                                               <span className="inline-flex items-center gap-2 text-sm font-semibold text-white">
                                                 <FileCode2 className="size-4 text-cyan-200" />
                                                 {model.label}
                                               </span>
-                                              <span className="mt-1 block text-sm text-slate-400">{model.notes.length} nota(s) visiveis neste modelo</span>
+                                              <span className="mt-1 block text-sm text-slate-400">
+                                                {modelLoading ? 'Preparando notas deste modelo...' : `${model.notes.length} nota(s) visiveis neste modelo`}
+                                              </span>
                                             </span>
                                           </button>
                                         </Collapsible.Trigger>
@@ -999,42 +1159,76 @@ function App() {
                                       <Collapsible.Content className="collapsible-panel overflow-hidden border-t border-white/8 px-3 pb-3 sm:px-4">
                                         <div className="overflow-hidden rounded-[22px] border border-white/8 bg-slate-950/72">
                                           <div className="border-b border-white/8 bg-white/[0.04] px-4 py-3 text-xs uppercase tracking-[0.18em] text-slate-400">
-                                            Duplo clique em uma nota para salvar a copia. Botao direito abre as outras acoes do arquivo.
+                                            Duplo clique salva uma copia. O botao XML abre a visualizacao identada e o botao direito abre as acoes do arquivo.
                                           </div>
                                           <div className="overflow-x-auto">
-                                            <div className="min-w-[760px]">
-                                              <div className="grid grid-cols-[140px_110px_minmax(0,1fr)_130px_64px] items-center gap-4 border-b border-white/8 bg-white/[0.04] px-4 py-3 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
+                                            <div className="min-w-[840px]">
+                                              <div className="grid grid-cols-[140px_110px_minmax(0,1fr)_130px_72px_64px] items-center gap-4 border-b border-white/8 bg-white/[0.04] px-4 py-3 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
                                                 <span>Numero</span>
                                                 <span>Serie</span>
                                                 <span>Chave de acesso</span>
                                                 <span>Emissao</span>
+                                                <span className="text-center">XML</span>
                                                 <span className="text-right">Sel.</span>
                                               </div>
 
                                               <div className="divide-y divide-white/6">
-                                                {model.notes.map((note) => (
-                                                  <div
-                                                    key={note.id}
-                                                    onDoubleClick={() => void handleSaveNoteCopy(note.id)}
-                                                    onContextMenu={(event) => {
-                                                      event.preventDefault()
-                                                      setContextMenu({ noteId: note.id, x: event.clientX, y: event.clientY })
-                                                    }}
-                                                    className="grid cursor-default grid-cols-[140px_110px_minmax(0,1fr)_130px_64px] items-center gap-4 px-4 py-3 text-sm text-slate-200 transition hover:bg-cyan-400/[0.06]"
-                                                  >
-                                                    <span className="font-medium text-white">{note.number}</span>
-                                                    <span className="text-slate-300">{note.series}</span>
-                                                    <span className="truncate font-mono text-[13px] text-slate-400">{note.accessKey}</span>
-                                                    <span className="text-slate-300">{formatIssuedDate(note.issueDate)}</span>
-                                                    <div className="flex justify-end">
-                                                      <CheckboxShell
-                                                        checked={selectedNoteIds.has(note.id)}
-                                                        label={`Selecionar nota ${note.number}`}
-                                                        onCheckedChange={(checked) => handleToggleOne(note.id, checked === true)}
-                                                      />
+                                                {model.notes.map((note) => {
+                                                  const previewOpen = expandedNotePreviews.has(note.id)
+                                                  const previewLoading = loadingPreviewIds.has(note.id)
+                                                  const previewCache = notePreviewById[note.id]
+
+                                                  return (
+                                                    <div key={note.id}>
+                                                      <div
+                                                        onDoubleClick={() => void handleSaveNoteCopy(note.id)}
+                                                        onContextMenu={(event) => {
+                                                          event.preventDefault()
+                                                          setContextMenu({ noteId: note.id, x: event.clientX, y: event.clientY })
+                                                        }}
+                                                        className="grid cursor-default grid-cols-[140px_110px_minmax(0,1fr)_130px_72px_64px] items-center gap-4 px-4 py-3 text-sm text-slate-200 transition hover:bg-cyan-400/[0.06]"
+                                                      >
+                                                        <span className="font-medium text-white">{note.number}</span>
+                                                        <span className="text-slate-300">{note.series}</span>
+                                                        <span className="truncate font-mono text-[13px] text-slate-400">{note.accessKey}</span>
+                                                        <span className="text-slate-300">{formatIssuedDate(note.issueDate)}</span>
+                                                        <div className="flex justify-center">
+                                                          <button
+                                                            type="button"
+                                                            aria-busy={previewLoading}
+                                                            title={previewOpen ? 'Ocultar XML' : 'Visualizar XML'}
+                                                            onClick={(event) => {
+                                                              event.stopPropagation()
+                                                              void handleNotePreviewToggle(note.id)
+                                                            }}
+                                                            className="inline-flex size-10 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04] text-slate-200 transition hover:border-cyan-300/35 hover:bg-cyan-400/10 hover:text-cyan-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/70"
+                                                          >
+                                                            {previewLoading ? <InlineLoader compact /> : previewOpen ? <ChevronDown className="size-4" /> : <FileCode2 className="size-4" />}
+                                                          </button>
+                                                        </div>
+                                                        <div className="flex justify-end">
+                                                          <CheckboxShell
+                                                            checked={selectedNoteIds.has(note.id)}
+                                                            label={`Selecionar nota ${note.number}`}
+                                                            onCheckedChange={(checked) => handleToggleOne(note.id, checked === true)}
+                                                          />
+                                                        </div>
+                                                      </div>
+
+                                                      {(previewLoading || previewOpen) && (
+                                                        <div className="border-t border-white/8 bg-slate-950/88 px-4 py-4">
+                                                          {previewLoading ? (
+                                                            <div className="rounded-[22px] border border-cyan-300/15 bg-cyan-400/[0.06] px-4 py-4 text-sm text-slate-200">
+                                                              <InlineLoader label="Carregando XML para visualizacao..." />
+                                                            </div>
+                                                          ) : previewCache ? (
+                                                            <XmlPreviewPanel fileName={previewCache.fileName} xmlText={previewCache.xmlText} />
+                                                          ) : null}
+                                                        </div>
+                                                      )}
                                                     </div>
-                                                  </div>
-                                                ))}
+                                                  )
+                                                })}
                                               </div>
                                             </div>
                                           </div>
@@ -1145,6 +1339,37 @@ function App() {
 
 type LoadingScreenProps = {
   message?: string
+}
+
+function InlineLoader({ label, compact = false }: { label?: string; compact?: boolean }) {
+  const spinnerSize = compact ? 'size-4 border-[1.5px]' : 'size-5 border-2'
+  const labelClass = compact ? 'text-xs' : 'text-sm'
+
+  return (
+    <span className={`inline-flex items-center gap-2 ${labelClass} text-cyan-100`}>
+      <span className={`${spinnerSize} rounded-full border-cyan-200/25 border-t-cyan-100 animate-spin`} />
+      {label ? <span className="leading-none">{label}</span> : null}
+    </span>
+  )
+}
+
+function XmlPreviewPanel({ fileName, xmlText }: NotePreviewCache) {
+  return (
+    <div className="overflow-hidden rounded-[24px] border border-white/10 bg-slate-950/92 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+      <div className="flex flex-col gap-2 border-b border-white/8 bg-white/[0.04] px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <p className="text-xs uppercase tracking-[0.18em] text-cyan-200/70">Visualizacao do XML</p>
+          <p className="mt-1 text-sm font-medium text-white">Somente leitura, com identacao para confer?ncia.</p>
+        </div>
+        <p className="truncate font-mono text-[12px] text-slate-400" title={fileName}>
+          {fileName}
+        </p>
+      </div>
+      <div className="max-h-[420px] overflow-auto px-4 py-4">
+        <pre className="whitespace-pre-wrap break-all font-mono text-[12px] leading-6 text-slate-200">{xmlText}</pre>
+      </div>
+    </div>
+  )
 }
 
 function LoadingScreen({ message = 'Preparando a aplicacao...' }: LoadingScreenProps) {
@@ -1597,6 +1822,25 @@ function formatRange(range: DateRange | undefined) {
   return `Ate ${format(range.to!, 'dd/MM/yyyy', { locale: ptBR })}`
 }
 
+function parseLastSearchRange(value: LastSearchState): DateRange | null {
+  if (!value?.startDate || !value?.endDate) {
+    return null
+  }
+
+  return {
+    from: parseISO(value.startDate),
+    to: parseISO(value.endDate),
+  }
+}
+
+function formatLastSearchRange(range: DateRange | null) {
+  if (!range?.from || !range?.to) {
+    return 'Nenhuma busca feita ainda'
+  }
+
+  return formatRange(range)
+}
+
 function formatIsoDate(value: Date) {
   return format(value, 'yyyy-MM-dd')
 }
@@ -1661,11 +1905,10 @@ function compareModelLabels(left: string, right: string) {
   return left.localeCompare(right)
 
 }
-function buildExpansionDefaults(nextNotes: BackendNote[]) {
-  const grouped = groupNotes(nextNotes)
+function buildExpansionDefaults() {
   return {
-    companyIds: new Set(grouped.map((company) => company.id)),
-    modelIds: new Set(grouped.flatMap((company) => company.models.slice(0, 1).map((model) => model.id))),
+    companyIds: new Set<string>(),
+    modelIds: new Set<string>(),
   }
 }
 
@@ -1680,13 +1923,15 @@ function deriveCheckedState(ids: string[], selected: Set<string>): CheckedState 
   return 'indeterminate'
 }
 
-function toggleSetValue(current: Set<string>, id: string) {
+function addSetValue(current: Set<string>, id: string) {
   const next = new Set(current)
-  if (next.has(id)) {
-    next.delete(id)
-  } else {
-    next.add(id)
-  }
+  next.add(id)
+  return next
+}
+
+function removeSetValue(current: Set<string>, id: string) {
+  const next = new Set(current)
+  next.delete(id)
   return next
 }
 
