@@ -25,7 +25,10 @@ declare global {
 }
 
 const ENABLE_MOCK_BRIDGE = import.meta.env.DEV || new URLSearchParams(window.location.search).has('mock')
-const REQUIRED_API_METHODS = ['get_initial_state', 'load_startup_context']
+const REQUIRED_API_METHODS = ['get_initial_state']
+const BRIDGE_CONNECT_TIMEOUT_MS = ENABLE_MOCK_BRIDGE ? 1500 : 90000
+const BRIDGE_METHOD_TIMEOUT_MS = ENABLE_MOCK_BRIDGE ? 1500 : 20000
+const BRIDGE_POLL_INTERVAL_MS = 120
 
 const mockNotes: BackendNote[] = [
   {
@@ -79,7 +82,7 @@ export async function getDesktopBridge(): Promise<DesktopBridge> {
 }
 
 async function createDesktopBridge(): Promise<DesktopBridge> {
-  const pywebviewApi = await waitForPywebviewApi(ENABLE_MOCK_BRIDGE ? 1500 : 8000)
+  const pywebviewApi = await waitForPywebviewApi(BRIDGE_CONNECT_TIMEOUT_MS)
   if (pywebviewApi) {
     return {
       getInitialState: () => callApi<InitialState>(pywebviewApi, 'get_initial_state'),
@@ -132,7 +135,7 @@ function waitForPywebviewApi(timeoutMs: number): Promise<Record<string, (...args
       check()
     }
 
-    const poll = window.setInterval(check, 150)
+    const poll = window.setInterval(check, BRIDGE_POLL_INTERVAL_MS)
     const timeout = window.setTimeout(() => finish(null), timeoutMs)
     window.addEventListener('pywebviewready', onReady, { once: true })
     check()
@@ -158,8 +161,49 @@ function resolveApiMethod(api: Record<string, (...args: unknown[]) => Promise<un
   return null
 }
 
-function callApi<T>(api: Record<string, (...args: unknown[]) => Promise<unknown>>, methodName: string, ...args: unknown[]) {
-  const method = resolveApiMethod(api, methodName)
+function waitForApiMethod(
+  api: Record<string, (...args: unknown[]) => Promise<unknown>>,
+  methodName: string,
+  timeoutMs: number,
+) {
+  return new Promise<((...args: unknown[]) => Promise<unknown>) | null>((resolve) => {
+    const immediate = resolveApiMethod(api, methodName)
+    if (immediate) {
+      resolve(immediate)
+      return
+    }
+
+    let settled = false
+
+    const finish = (method: ((...args: unknown[]) => Promise<unknown>) | null) => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      window.clearTimeout(timeout)
+      window.clearInterval(poll)
+      resolve(method)
+    }
+
+    const check = () => {
+      const nextMethod = resolveApiMethod(api, methodName)
+      if (nextMethod) {
+        finish(nextMethod)
+      }
+    }
+
+    const poll = window.setInterval(check, BRIDGE_POLL_INTERVAL_MS)
+    const timeout = window.setTimeout(() => finish(null), timeoutMs)
+  })
+}
+
+async function callApi<T>(
+  api: Record<string, (...args: unknown[]) => Promise<unknown>>,
+  methodName: string,
+  ...args: unknown[]
+) {
+  const method = await waitForApiMethod(api, methodName, BRIDGE_METHOD_TIMEOUT_MS)
   if (!method) {
     const availableMethods = Object.keys(api).sort().join(', ') || '(nenhum metodo exposto)'
     throw new Error(`Metodo ${methodName} nao foi exposto pela API nativa. Disponiveis: ${availableMethods}`)
@@ -419,5 +463,6 @@ function formatDateForBridge(date: Date) {
   const day = `${date.getDate()}`.padStart(2, '0')
   return `${year}-${month}-${day}`
 }
+
 
 

@@ -164,27 +164,6 @@ def _ensure_string_list(value: Any) -> List[str]:
         return [str(item) for item in value]
     return []
 
-
-def _expose_window_api(window: webview.Window, api: WebviewApi) -> None:
-    window.expose(
-        api.get_initial_state,
-        api.getInitialState,
-        api.load_startup_context,
-        api.loadStartupContext,
-        api.choose_base_path,
-        api.save_base_path,
-        api.detect_from_danfe,
-        api.detect_default_base,
-        api.test_structure,
-        api.start_scan,
-        api.get_scan_job,
-        api.save_selected_zip,
-        api.save_note_copy,
-        api.open_note_location,
-        api.get_note_xml_preview,
-    )
-
-
 def main() -> None:
     root_dir = resource_root()
     os.chdir(root_dir)
@@ -197,15 +176,17 @@ def main() -> None:
 
     service = XmlAppService()
     api = WebviewApi(service)
+    window_url = 'frontend/dist/index.html'
 
     window = webview.create_window(
         APP_TITLE,
-        url='frontend/dist/index.html',
+        url=window_url,
         js_api=api,
         width=1460,
         height=920,
         min_size=(840, 620),
         resizable=True,
+        maximized=True,
         confirm_close=False,
         background_color='#020817',
         text_select=True,
@@ -214,18 +195,8 @@ def main() -> None:
         raise SystemExit('Nao foi possivel criar a janela principal.')
 
     api.bind_window(window)
-    _expose_window_api(window, api)
-
-    def maximize_on_start() -> None:
-        maximize = getattr(window, 'maximize', None)
-        if callable(maximize):
-            try:
-                maximize()
-            except Exception:
-                pass
 
     webview.start(
-        maximize_on_start,
         debug=False,
         http_server=True,
         private_mode=True,

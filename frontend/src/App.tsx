@@ -1,4 +1,4 @@
-﻿import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { type PointerEvent as ReactPointerEvent, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as Checkbox from '@radix-ui/react-checkbox'
 import * as Collapsible from '@radix-ui/react-collapsible'
 import * as Dialog from '@radix-ui/react-dialog'
@@ -9,7 +9,7 @@ import { endOfMonth, format, parseISO, startOfMonth, subMonths } from 'date-fns'
 import { DayPicker, type DateRange } from 'react-day-picker'
 import {
   Building2,
-  CalendarRange,
+  CalendarDays,
   Check,
   ChevronDown,
   ChevronRight,
@@ -60,6 +60,11 @@ type NotePreviewCache = {
   xmlText: string
 }
 
+type XmlHighlightPart = {
+  text: string
+  matchIndex: number | null
+}
+
 type NoticeTone = 'info' | 'success' | 'error'
 
 type NoticeState = {
@@ -73,11 +78,49 @@ type ContextMenuState = {
   y: number
 }
 
+const NOTE_COLUMN_KEYS = ['number', 'series', 'accessKey', 'issueDate'] as const
+type NoteColumnKey = (typeof NOTE_COLUMN_KEYS)[number]
+
 const MODEL_ORDER: Record<string, number> = {
   'NF-e': 0,
   'NFC-e': 1,
   'CT-e': 2,
 }
+
+const NOTE_COLUMN_DEFAULT_WEIGHTS: Record<NoteColumnKey, number> = {
+  number: 1.1,
+  series: 0.85,
+  accessKey: 3.25,
+  issueDate: 1.2,
+}
+
+const NOTE_COLUMN_MIN_WEIGHTS: Record<NoteColumnKey, number> = {
+  number: 0.78,
+  series: 0.65,
+  accessKey: 1.25,
+  issueDate: 1.0,
+}
+
+const NOTE_COLUMN_MAX_WEIGHTS: Record<NoteColumnKey, number> = {
+  number: 2.3,
+  series: 1.8,
+  accessKey: 6.2,
+  issueDate: 2.5,
+}
+
+const NOTE_ACTION_COLUMN_WIDTHS = {
+  xml: 64,
+  select: 64,
+}
+
+const NOTE_COLUMN_MIN_PIXELS: Record<NoteColumnKey, number> = {
+  number: 76,
+  series: 68,
+  accessKey: 180,
+  issueDate: 112,
+}
+
+const NOTE_GRID_GAP_PX = 12
 
 function App() {
   const [bridge, setBridge] = useState<DesktopBridge | null>(null)
@@ -90,6 +133,7 @@ function App() {
 
   const [notes, setNotes] = useState<BackendNote[]>([])
   const [selectedNoteIds, setSelectedNoteIds] = useState<Set<string>>(new Set())
+  const [noteColumnWeights, setNoteColumnWeights] = useState<Record<NoteColumnKey, number>>(NOTE_COLUMN_DEFAULT_WEIGHTS)
   const [expandedCompanies, setExpandedCompanies] = useState<Set<string>>(new Set())
   const [expandedModels, setExpandedModels] = useState<Set<string>>(new Set())
   const [expandedNotePreviews, setExpandedNotePreviews] = useState<Set<string>>(new Set())
@@ -100,6 +144,7 @@ function App() {
 
   const [configOpen, setConfigOpen] = useState(false)
   const [activityOpen, setActivityOpen] = useState(true)
+  const [showBootLogs, setShowBootLogs] = useState(false)
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
 
   const [startupInfo, setStartupInfo] = useState<StartupState | null>(null)
@@ -115,12 +160,12 @@ function App() {
   const [scanJobId, setScanJobId] = useState('')
   const [scanSnapshot, setScanSnapshot] = useState<ScanJobSnapshot | null>(null)
   const [busyAction, setBusyAction] = useState<null | 'config' | 'scan' | 'zip' | 'note'>(null)
+  const [isStartupContextLoading, setIsStartupContextLoading] = useState(false)
 
   const lastLogCountRef = useRef<Record<string, number>>({})
   const bridgeRetryRef = useRef(0)
   const toggleLoadTimersRef = useRef<Record<string, number>>({})
-  const previewGenerationRef = useRef(0)
-
+  const previewGenerationRef = useRef(0)
   const appendLogs = useCallback((lines: string[]) => {
     if (lines.length === 0) {
       return
@@ -156,17 +201,26 @@ function App() {
 
   useEffect(() => {
     return () => {
-      clearAllToggleTimers()
-    }
+      clearAllToggleTimers()    }
   }, [clearAllToggleTimers])
+
   useEffect(() => {
     let active = true
     let retryTimer = 0
-    const bootTimer = window.setTimeout(() => {
-      if (active) {
-        setIsBooting(false)
+    let startupTimer = 0
+    let handshakeOpen = true
+
+    appendLogs(['[INFO] Aguardando a API nativa do pywebview...'])
+    setNotice({
+      tone: 'info',
+      message: 'Conectando ao backend nativo. A interface sera liberada assim que essa etapa terminar.',
+    })
+
+    const heartbeatTimer = window.setInterval(() => {
+      if (active && handshakeOpen) {
+        appendLogs(['[INFO] Aguardando o backend nativo concluir o handshake inicial...'])
       }
-    }, 0)
+    }, 8000)
 
     const applyInitialState = (state: InitialState) => {
       document.title = state.appTitle
@@ -232,8 +286,11 @@ function App() {
           return
         }
 
+        handshakeOpen = false
+        window.clearInterval(heartbeatTimer)
         setBridge(desktopBridge)
         bridgeRetryRef.current = 0
+        appendLogs(['[OK] Backend nativo conectado.'])
 
         const initialState = await desktopBridge.getInitialState()
         if (!active) {
@@ -241,31 +298,40 @@ function App() {
         }
 
         applyInitialState(initialState)
+        setIsBooting(false)
 
-        window.requestAnimationFrame(() => {
-          window.setTimeout(() => {
-            void desktopBridge
-              .loadStartupContext()
-              .then((startupContext) => {
-                if (!active) {
-                  return
-                }
-                applyStartupContext(startupContext)
-              })
-              .catch((error) => {
-                if (!active) {
-                  return
-                }
+        startupTimer = window.setTimeout(() => {
+          if (!active) {
+            return
+          }
 
-                const message = error instanceof Error ? error.message : 'Falha ao finalizar a configuracao inicial.'
-                setNotice({
-                  tone: 'error',
-                  message,
-                })
-                appendLogs([`[ERRO] ${message}`])
+          setIsStartupContextLoading(true)
+          void desktopBridge
+            .loadStartupContext()
+            .then((startupContext) => {
+              if (!active) {
+                return
+              }
+              applyStartupContext(startupContext)
+            })
+            .catch((error) => {
+              if (!active) {
+                return
+              }
+
+              const message = error instanceof Error ? error.message : 'Falha ao finalizar a configuracao inicial.'
+              setNotice({
+                tone: 'error',
+                message,
               })
-          }, 0)
-        })
+              appendLogs([`[ERRO] ${message}`])
+            })
+            .finally(() => {
+              if (active) {
+                setIsStartupContextLoading(false)
+              }
+            })
+        }, 220)
       } catch (error) {
         if (!active) {
           return
@@ -274,15 +340,16 @@ function App() {
         const message = error instanceof Error ? error.message : 'Falha ao carregar a aplicacao.'
         bridgeRetryRef.current += 1
         const attempt = bridgeRetryRef.current
-        const retryDelayMs = Math.min(2000 + attempt * 750, 6000)
+        const retryDelayMs = Math.min(2500 + attempt * 1250, 9000)
 
         setBridge(null)
+        setIsBooting(true)
         setNotice({
-          tone: attempt >= 4 ? 'error' : 'info',
+          tone: attempt >= 3 ? 'error' : 'info',
           message:
-            attempt >= 4
+            attempt >= 3
               ? `${message} Continuando a tentar reconectar ao backend nativo.`
-              : 'Conectando ao backend nativo. A interface ja abriu e as acoes vao liberar assim que a conexao terminar.',
+              : 'Conectando ao backend nativo. A janela continua carregando ate essa etapa terminar.',
         })
         appendLogs([`[AVISO] Tentativa ${attempt} de conexao ao backend nativo falhou: ${message}`])
 
@@ -298,8 +365,9 @@ function App() {
 
     return () => {
       active = false
-      window.clearTimeout(bootTimer)
+      window.clearInterval(heartbeatTimer)
       window.clearTimeout(retryTimer)
+      window.clearTimeout(startupTimer)
     }
   }, [appendLogs])
 
@@ -464,22 +532,94 @@ function App() {
   const canSaveZip = selectedNoteIds.size > 0 && !isScanRunning && !!bridge
   const zipPeriod = lastSearchPeriod?.from && lastSearchPeriod?.to ? lastSearchPeriod : period
 
-  const selectionSummary = useMemo(() => {
+  const foundSummary = useMemo(() => {
+    if (notes.length === 0) {
+      return '0 XMLs'
+    }
+
+    return `${notes.length} XMLs`
+  }, [notes.length])
+
+  const selectedSummary = useMemo(() => {
     if (stats.selectedTotal === 0) {
-      return 'Nenhum XML marcado ainda.'
+      return '0 XMLs'
     }
 
-    if (stats.selectedVisible === stats.selectedTotal) {
-      return `${stats.selectedTotal} XML(s) marcados.`
-    }
-
-    return `${stats.selectedVisible} visivel(is) marcados de ${stats.selectedTotal} no total.`
-  }, [stats.selectedTotal, stats.selectedVisible])
+    return `${stats.selectedTotal} XMLs`
+  }, [stats.selectedTotal])
 
   const lastSearchSummary = useMemo(() => formatLastSearchRange(lastSearchPeriod), [lastSearchPeriod])
 
-  const statusMessage = isScanRunning && scanSnapshot?.progressText ? scanSnapshot.progressText : notice.message
+  const statusMessage =
+    isScanRunning && scanSnapshot?.progressText
+      ? scanSnapshot.progressText
+      : isStartupContextLoading
+        ? 'Carregando configuracoes complementares em segundo plano.'
+        : notice.message
 
+  const noteGridTemplate = useMemo(
+    () =>
+      [
+        `minmax(${NOTE_COLUMN_MIN_PIXELS.number}px, ${noteColumnWeights.number}fr)`,
+        `minmax(${NOTE_COLUMN_MIN_PIXELS.series}px, ${noteColumnWeights.series}fr)`,
+        `minmax(${NOTE_COLUMN_MIN_PIXELS.accessKey}px, ${noteColumnWeights.accessKey}fr)`,
+        `minmax(${NOTE_COLUMN_MIN_PIXELS.issueDate}px, ${noteColumnWeights.issueDate}fr)`,
+        `${NOTE_ACTION_COLUMN_WIDTHS.xml}px`,
+        `${NOTE_ACTION_COLUMN_WIDTHS.select}px`,
+      ].join(' '),
+    [noteColumnWeights],
+  )
+
+  const handleNoteColumnResizeStart = useCallback(
+    (event: ReactPointerEvent<HTMLButtonElement>, columnKey: NoteColumnKey, nextColumnKey: NoteColumnKey) => {
+      event.preventDefault()
+      event.stopPropagation()
+
+      const host = event.currentTarget.closest('[data-note-grid-host="true"]')
+      if (!(host instanceof HTMLElement)) {
+        return
+      }
+
+      const startClientX = event.clientX
+      const startWeights = { ...noteColumnWeights }
+      const computedStyle = window.getComputedStyle(host)
+      const horizontalPadding = Number.parseFloat(computedStyle.paddingLeft || '0') + Number.parseFloat(computedStyle.paddingRight || '0')
+      const columnGap = Number.parseFloat(computedStyle.columnGap || computedStyle.gap || '0') || NOTE_GRID_GAP_PX
+      const totalFlexibleWeight = NOTE_COLUMN_KEYS.reduce((total, key) => total + startWeights[key], 0)
+      const flexibleWidth = Math.max(
+        host.clientWidth - horizontalPadding - NOTE_ACTION_COLUMN_WIDTHS.xml - NOTE_ACTION_COLUMN_WIDTHS.select - columnGap * (NOTE_COLUMN_KEYS.length + 1),
+        320,
+      )
+
+      const restoreCursor = document.body.style.cursor
+      const restoreUserSelect = document.body.style.userSelect
+      document.body.style.cursor = 'col-resize'
+      document.body.style.userSelect = 'none'
+
+      const onPointerMove = (moveEvent: PointerEvent) => {
+        const deltaWeight = ((moveEvent.clientX - startClientX) / flexibleWidth) * totalFlexibleWeight
+        setNoteColumnWeights(resizeAdjacentColumns(startWeights, columnKey, nextColumnKey, deltaWeight))
+      }
+
+      const cleanup = () => {
+        document.body.style.cursor = restoreCursor
+        document.body.style.userSelect = restoreUserSelect
+        window.removeEventListener('pointermove', onPointerMove)
+        window.removeEventListener('pointerup', cleanup)
+        window.removeEventListener('pointercancel', cleanup)
+      }
+
+      event.currentTarget.setPointerCapture?.(event.pointerId)
+      window.addEventListener('pointermove', onPointerMove)
+      window.addEventListener('pointerup', cleanup)
+      window.addEventListener('pointercancel', cleanup)
+    },
+    [noteColumnWeights],
+  )
+
+  const resetNoteColumnWeights = useCallback(() => {
+    setNoteColumnWeights(NOTE_COLUMN_DEFAULT_WEIGHTS)
+  }, [])
   const handleSaveConfig = async () => {
     if (!bridge || !configPath.trim()) {
       setNotice({
@@ -941,7 +1081,7 @@ function App() {
   }
 
   if (isBooting) {
-    return <LoadingScreen />
+    return <LoadingScreen message={notice.message} logs={activityLines} logOpen={showBootLogs} onToggleLogs={() => setShowBootLogs((current) => !current)} />
   }
 
   return (
@@ -971,7 +1111,7 @@ function App() {
           </div>
 
           <div className="flex-1 space-y-5 overflow-y-auto px-5 py-5 sm:px-6">
-            <SidebarCard icon={<CalendarRange className="size-4" />} title="Periodo">
+            <SidebarCard icon={<CalendarDays className="size-4" />} title="Periodo">
               <RangePicker value={period} onChange={setPeriod} />
               <div className="grid grid-cols-2 gap-2">
                 <QuickAction onClick={handleUseCurrentMonth}>Mes atual</QuickAction>
@@ -1019,7 +1159,7 @@ function App() {
         <main className="min-w-0 flex-1 px-4 py-5 sm:px-6 lg:px-7 lg:py-7 xl:px-8">
           <div className="flex flex-col gap-5 pb-28">
             <section className="rounded-[32px] border border-white/10 bg-slate-950/56 p-5 shadow-[0_28px_90px_rgba(2,6,23,0.5)] backdrop-blur sm:p-6">
-              <div className="grid gap-3 xl:grid-cols-[minmax(0,1.45fr)_minmax(240px,0.95fr)_minmax(240px,0.95fr)]">
+              <div className="flex flex-col gap-3">
                 <div className="rounded-[28px] border border-white/10 bg-white/[0.03] px-5 py-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
                   <div className="flex flex-col gap-4 xl:flex-row xl:items-center xl:justify-between">
                     <div className="min-w-0">
@@ -1028,13 +1168,22 @@ function App() {
                         {configPath || 'Nao configurada ainda'}
                       </p>
                     </div>
-                    <ActionButton variant="secondary" onClick={() => setConfigOpen(true)} icon={<HardDrive className="size-4" />} className="shrink-0">
+                    <ActionButton
+                      variant="secondary"
+                      onClick={() => setConfigOpen(true)}
+                      icon={<HardDrive className="size-4" />}
+                      className="w-full justify-center sm:w-auto sm:shrink-0"
+                    >
                       Configuracao
                     </ActionButton>
                   </div>
                 </div>
-                <InfoPill label="Selecao" value={selectionSummary} />
-                <InfoPill label="Periodo selecionado" value={lastSearchSummary} />
+
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                  <InfoPill label="Periodo selecionado" value={lastSearchSummary} />
+                  <InfoPill label="XMLs encontrados" value={foundSummary} />
+                  <InfoPill label="Total selecionado" value={selectedSummary} />
+                </div>
               </div>
               <div className="mt-4">
                 <NoticeCard tone={notice.tone} message={statusMessage} />
@@ -1158,78 +1307,116 @@ function App() {
 
                                       <Collapsible.Content className="collapsible-panel overflow-hidden border-t border-white/8 px-3 pb-3 sm:px-4">
                                         <div className="overflow-hidden rounded-[22px] border border-white/8 bg-slate-950/72">
-                                          <div className="border-b border-white/8 bg-white/[0.04] px-4 py-3 text-xs uppercase tracking-[0.18em] text-slate-400">
-                                            Duplo clique salva uma copia. O botao XML abre a visualizacao identada e o botao direito abre as acoes do arquivo.
+                                          <div className="flex flex-col gap-3 border-b border-white/8 bg-white/[0.04] px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+                                            <p className="text-xs uppercase tracking-[0.18em] text-slate-400">
+                                              Duplo clique salva uma copia. O botao XML abre a visualizacao identada e o botao direito abre as acoes do arquivo.
+                                            </p>
+                                            <button
+                                              type="button"
+                                              onClick={resetNoteColumnWeights}
+                                              className="inline-flex items-center justify-center self-start rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-[11px] font-medium uppercase tracking-[0.16em] text-slate-300 transition hover:border-cyan-300/35 hover:bg-cyan-400/10 hover:text-cyan-100"
+                                              title="Volta as larguras padrao das colunas de dados."
+                                            >
+                                              Resetar colunas
+                                            </button>
                                           </div>
-                                          <div className="overflow-x-auto">
-                                            <div className="min-w-[840px]">
-                                              <div className="grid grid-cols-[140px_110px_minmax(0,1fr)_130px_72px_64px] items-center gap-4 border-b border-white/8 bg-white/[0.04] px-4 py-3 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
-                                                <span>Numero</span>
-                                                <span>Serie</span>
-                                                <span>Chave de acesso</span>
-                                                <span>Emissao</span>
-                                                <span className="text-center">XML</span>
-                                                <span className="text-right">Sel.</span>
-                                              </div>
+                                          <div className="overflow-hidden">
+                                            <div
+                                              data-note-grid-host="true"
+                                              className="grid items-center gap-3 border-b border-white/8 bg-white/[0.04] px-4 py-3 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400"
+                                              style={{ gridTemplateColumns: noteGridTemplate }}
+                                            >
+                                              <NoteColumnHeader
+                                                label="Numero"
+                                                columnKey="number"
+                                                onResizeStart={handleNoteColumnResizeStart}
+                                              />
+                                              <NoteColumnHeader
+                                                label="Serie"
+                                                columnKey="series"
+                                                onResizeStart={handleNoteColumnResizeStart}
+                                              />
+                                              <NoteColumnHeader
+                                                label="Chave"
+                                                columnKey="accessKey"
+                                                onResizeStart={handleNoteColumnResizeStart}
+                                              />
+                                              <NoteColumnHeader
+                                                label="Emissao"
+                                                columnKey="issueDate"
+                                                onResizeStart={handleNoteColumnResizeStart}
+                                              />
+                                              <span className="truncate text-center">XML</span>
+                                              <span className="truncate text-right">Sel.</span>
+                                            </div>
 
-                                              <div className="divide-y divide-white/6">
-                                                {model.notes.map((note) => {
-                                                  const previewOpen = expandedNotePreviews.has(note.id)
-                                                  const previewLoading = loadingPreviewIds.has(note.id)
-                                                  const previewCache = notePreviewById[note.id]
+                                            <div className="divide-y divide-white/6">
+                                              {model.notes.map((note) => {
+                                                const previewOpen = expandedNotePreviews.has(note.id)
+                                                const previewLoading = loadingPreviewIds.has(note.id)
+                                                const previewCache = notePreviewById[note.id]
 
-                                                  return (
-                                                    <div key={note.id}>
-                                                      <div
-                                                        onDoubleClick={() => void handleSaveNoteCopy(note.id)}
-                                                        onContextMenu={(event) => {
-                                                          event.preventDefault()
-                                                          setContextMenu({ noteId: note.id, x: event.clientX, y: event.clientY })
-                                                        }}
-                                                        className="grid cursor-default grid-cols-[140px_110px_minmax(0,1fr)_130px_72px_64px] items-center gap-4 px-4 py-3 text-sm text-slate-200 transition hover:bg-cyan-400/[0.06]"
-                                                      >
-                                                        <span className="font-medium text-white">{note.number}</span>
-                                                        <span className="text-slate-300">{note.series}</span>
-                                                        <span className="truncate font-mono text-[13px] text-slate-400">{note.accessKey}</span>
-                                                        <span className="text-slate-300">{formatIssuedDate(note.issueDate)}</span>
-                                                        <div className="flex justify-center">
-                                                          <button
-                                                            type="button"
-                                                            aria-busy={previewLoading}
-                                                            title={previewOpen ? 'Ocultar XML' : 'Visualizar XML'}
-                                                            onClick={(event) => {
-                                                              event.stopPropagation()
-                                                              void handleNotePreviewToggle(note.id)
-                                                            }}
-                                                            className="inline-flex size-10 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04] text-slate-200 transition hover:border-cyan-300/35 hover:bg-cyan-400/10 hover:text-cyan-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/70"
-                                                          >
-                                                            {previewLoading ? <InlineLoader compact /> : previewOpen ? <ChevronDown className="size-4" /> : <FileCode2 className="size-4" />}
-                                                          </button>
-                                                        </div>
-                                                        <div className="flex justify-end">
-                                                          <CheckboxShell
-                                                            checked={selectedNoteIds.has(note.id)}
-                                                            label={`Selecionar nota ${note.number}`}
-                                                            onCheckedChange={(checked) => handleToggleOne(note.id, checked === true)}
-                                                          />
-                                                        </div>
+                                                return (
+                                                  <div key={note.id}>
+                                                    <div
+                                                      onDoubleClick={() => void handleSaveNoteCopy(note.id)}
+                                                      onContextMenu={(event) => {
+                                                        event.preventDefault()
+                                                        setContextMenu({ noteId: note.id, x: event.clientX, y: event.clientY })
+                                                      }}
+                                                      className="grid cursor-default items-center gap-3 px-4 py-3 text-sm text-slate-200 transition hover:bg-cyan-400/[0.06]"
+                                                      style={{ gridTemplateColumns: noteGridTemplate }}
+                                                    >
+                                                      <span className="min-w-0 truncate font-medium text-white" title={note.number}>
+                                                        {note.number}
+                                                      </span>
+                                                      <span className="min-w-0 truncate text-slate-300" title={note.series}>
+                                                        {note.series}
+                                                      </span>
+                                                      <span className="min-w-0 truncate font-mono text-[13px] text-slate-400" title={note.accessKey}>
+                                                        {note.accessKey}
+                                                      </span>
+                                                      <span className="min-w-0 truncate text-slate-300" title={formatIssuedDate(note.issueDate)}>
+                                                        {formatIssuedDate(note.issueDate)}
+                                                      </span>
+                                                      <div className="flex justify-center">
+                                                        <button
+                                                          type="button"
+                                                          aria-busy={previewLoading}
+                                                          title={previewOpen ? 'Ocultar XML' : 'Visualizar XML'}
+                                                          onClick={(event) => {
+                                                            event.stopPropagation()
+                                                            void handleNotePreviewToggle(note.id)
+                                                          }}
+                                                          onDoubleClick={(event) => event.stopPropagation()}
+                                                          className="inline-flex size-10 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04] text-slate-200 transition hover:border-cyan-300/35 hover:bg-cyan-400/10 hover:text-cyan-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/70"
+                                                        >
+                                                          {previewLoading ? <InlineLoader compact /> : previewOpen ? <ChevronDown className="size-4" /> : <FileCode2 className="size-4" />}
+                                                        </button>
                                                       </div>
-
-                                                      {(previewLoading || previewOpen) && (
-                                                        <div className="border-t border-white/8 bg-slate-950/88 px-4 py-4">
-                                                          {previewLoading ? (
-                                                            <div className="rounded-[22px] border border-cyan-300/15 bg-cyan-400/[0.06] px-4 py-4 text-sm text-slate-200">
-                                                              <InlineLoader label="Carregando XML para visualizacao..." />
-                                                            </div>
-                                                          ) : previewCache ? (
-                                                            <XmlPreviewPanel fileName={previewCache.fileName} xmlText={previewCache.xmlText} />
-                                                          ) : null}
-                                                        </div>
-                                                      )}
+                                                      <div className="flex justify-end">
+                                                        <CheckboxShell
+                                                          checked={selectedNoteIds.has(note.id)}
+                                                          label={`Selecionar nota ${note.number}`}
+                                                          onCheckedChange={(checked) => handleToggleOne(note.id, checked === true)}
+                                                        />
+                                                      </div>
                                                     </div>
-                                                  )
-                                                })}
-                                              </div>
+
+                                                    {(previewLoading || previewOpen) && (
+                                                      <div className="border-t border-white/8 bg-slate-950/88 px-4 py-4">
+                                                        {previewLoading ? (
+                                                          <div className="rounded-[22px] border border-cyan-300/15 bg-cyan-400/[0.06] px-4 py-4 text-sm text-slate-200">
+                                                            <InlineLoader label="Carregando XML para visualizacao..." />
+                                                          </div>
+                                                        ) : previewCache ? (
+                                                          <XmlPreviewPanel fileName={previewCache.fileName} xmlText={previewCache.xmlText} />
+                                                        ) : null}
+                                                      </div>
+                                                    )}
+                                                  </div>
+                                                )
+                                              })}
                                             </div>
                                           </div>
                                         </div>
@@ -1339,6 +1526,15 @@ function App() {
 
 type LoadingScreenProps = {
   message?: string
+  logs?: string[]
+  logOpen: boolean
+  onToggleLogs: () => void
+}
+
+type SidebarCardProps = {
+  icon: ReactNode
+  title: string
+  children: ReactNode
 }
 
 function InlineLoader({ label, compact = false }: { label?: string; compact?: boolean }) {
@@ -1353,29 +1549,208 @@ function InlineLoader({ label, compact = false }: { label?: string; compact?: bo
   )
 }
 
+function NoteColumnHeader({
+  label,
+  columnKey,
+  onResizeStart,
+}: {
+  label: string
+  columnKey: NoteColumnKey
+  onResizeStart: (event: ReactPointerEvent<HTMLButtonElement>, columnKey: NoteColumnKey, nextColumnKey: NoteColumnKey) => void
+}) {
+  const columnIndex = NOTE_COLUMN_KEYS.indexOf(columnKey)
+  const nextColumnKey = NOTE_COLUMN_KEYS[columnIndex + 1]
+
+  return (
+    <div className="relative min-w-0 pr-3">
+      <span className="block truncate">{label}</span>
+      {nextColumnKey ? (
+        <button
+          type="button"
+          aria-label={`Redimensionar coluna ${label}`}
+          title={`Arraste para ajustar a largura da coluna ${label}. Duplo clique no botao Resetar colunas volta ao padrao.`}
+          onPointerDown={(event) => onResizeStart(event, columnKey, nextColumnKey)}
+          onDoubleClick={(event) => event.stopPropagation()}
+          className="group absolute -right-2 top-1/2 flex h-9 w-4 -translate-y-1/2 cursor-col-resize touch-none items-center justify-center"
+        >
+          <span className="h-6 w-px rounded-full bg-white/12 transition group-hover:h-7 group-hover:bg-cyan-300/55 group-focus-visible:bg-cyan-300/55" />
+        </button>
+      ) : null}
+    </div>
+  )
+}
+
 function XmlPreviewPanel({ fileName, xmlText }: NotePreviewCache) {
+  const [searchTerm, setSearchTerm] = useState('')
+  const trimmedSearchTerm = searchTerm.trim()
+  const [activeMatchIndex, setActiveMatchIndex] = useState(0)
+  const matchRefs = useRef<Array<HTMLElement | null>>([])
+  const xmlSearchMatches = useMemo(() => findXmlSearchMatches(xmlText, trimmedSearchTerm), [trimmedSearchTerm, xmlText])
+  const matchCount = xmlSearchMatches.length
+  const currentMatchIndex = matchCount === 0 ? 0 : Math.min(activeMatchIndex, matchCount - 1)
+  const highlightedXml = useMemo(() => buildHighlightedXml(xmlText, xmlSearchMatches), [xmlSearchMatches, xmlText])
+
+  useEffect(() => {
+    matchRefs.current = []
+  }, [trimmedSearchTerm, xmlText])
+
+  useEffect(() => {
+    if (matchCount === 0) {
+      return
+    }
+
+    const target = matchRefs.current[currentMatchIndex]
+    target?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }, [currentMatchIndex, matchCount])
+
+  const handleStepMatch = (direction: 1 | -1) => {
+    if (matchCount === 0) {
+      return
+    }
+
+    setActiveMatchIndex((current) => {
+      const next = current + direction
+      if (next < 0) {
+        return matchCount - 1
+      }
+      if (next >= matchCount) {
+        return 0
+      }
+      return next
+    })
+  }
+
   return (
     <div className="overflow-hidden rounded-[24px] border border-white/10 bg-slate-950/92 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
-      <div className="flex flex-col gap-2 border-b border-white/8 bg-white/[0.04] px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <p className="text-xs uppercase tracking-[0.18em] text-cyan-200/70">Visualizacao do XML</p>
-          <p className="mt-1 text-sm font-medium text-white">Somente leitura, com identacao para confer?ncia.</p>
+      <div className="border-b border-white/8 bg-white/[0.04] px-4 py-3">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p className="text-xs uppercase tracking-[0.18em] text-cyan-200/70">Visualizacao do XML</p>
+            <p className="mt-1 text-sm font-medium text-white">Somente leitura, com identacao para conferencia.</p>
+          </div>
+          <p className="truncate font-mono text-[12px] text-slate-400" title={fileName}>
+            {fileName}
+          </p>
         </div>
-        <p className="truncate font-mono text-[12px] text-slate-400" title={fileName}>
-          {fileName}
-        </p>
+        <div className="mt-3 flex flex-col gap-3 xl:flex-row xl:items-center">
+          <label className="flex min-w-0 flex-1 items-center gap-3 rounded-2xl border border-white/10 bg-slate-950/85 px-4 py-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+            <Search className="size-4 shrink-0 text-slate-500" />
+            <input
+              value={searchTerm}
+              onChange={(event) => {
+                setSearchTerm(event.target.value)
+                setActiveMatchIndex(0)
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault()
+                  handleStepMatch(event.shiftKey ? -1 : 1)
+                }
+              }}
+              placeholder="Pesquisar por tag, atributo ou valor dentro do XML"
+              className="w-full bg-transparent text-sm text-white outline-none placeholder:text-slate-500"
+            />
+          </label>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="inline-flex items-center rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium uppercase tracking-[0.16em] text-slate-300">
+              {trimmedSearchTerm ? `${matchCount} ocorrencia(s)` : 'Busca no XML'}
+            </div>
+            <button
+              type="button"
+              onClick={() => handleStepMatch(-1)}
+              disabled={matchCount === 0}
+              className="inline-flex items-center justify-center rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-[11px] font-medium uppercase tracking-[0.16em] text-slate-300 transition hover:border-cyan-300/35 hover:bg-cyan-400/10 hover:text-cyan-100 disabled:cursor-not-allowed disabled:border-white/8 disabled:text-slate-500"
+            >
+              Anterior
+            </button>
+            <button
+              type="button"
+              onClick={() => handleStepMatch(1)}
+              disabled={matchCount === 0}
+              className="inline-flex items-center justify-center rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-[11px] font-medium uppercase tracking-[0.16em] text-slate-300 transition hover:border-cyan-300/35 hover:bg-cyan-400/10 hover:text-cyan-100 disabled:cursor-not-allowed disabled:border-white/8 disabled:text-slate-500"
+            >
+              Proxima
+            </button>
+            {trimmedSearchTerm ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchTerm('')
+                  setActiveMatchIndex(0)
+                }}
+                className="inline-flex items-center justify-center rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-[11px] font-medium uppercase tracking-[0.16em] text-slate-300 transition hover:border-cyan-300/35 hover:bg-cyan-400/10 hover:text-cyan-100"
+              >
+                Limpar
+              </button>
+            ) : null}
+          </div>
+        </div>
       </div>
       <div className="max-h-[420px] overflow-auto px-4 py-4">
-        <pre className="whitespace-pre-wrap break-all font-mono text-[12px] leading-6 text-slate-200">{xmlText}</pre>
+        <pre className="whitespace-pre-wrap break-all font-mono text-[12px] leading-6 text-slate-200">
+          {highlightedXml.map((part, index) =>
+            part.matchIndex === null ? (
+              <span key={`xml-text-${index}`}>{part.text}</span>
+            ) : (
+              <mark
+                key={`xml-match-${part.matchIndex}`}
+                ref={(element) => {
+                  if (part.matchIndex !== null) {
+                    matchRefs.current[part.matchIndex] = element
+                  }
+                }}
+                className={part.matchIndex === currentMatchIndex ? 'rounded bg-amber-300 px-0.5 text-slate-950' : 'rounded bg-cyan-300/35 px-0.5 text-cyan-50'}
+              >
+                {part.text}
+              </mark>
+            ),
+          )}
+        </pre>
       </div>
     </div>
   )
 }
 
-function LoadingScreen({ message = 'Preparando a aplicacao...' }: LoadingScreenProps) {
+function LoadingScreen({ message = 'Preparando a aplicacao...', logs = [], logOpen, onToggleLogs }: LoadingScreenProps) {
+  const visibleLogs = logs.slice(-18)
+
   return (
-    <div className="flex min-h-screen items-center justify-center bg-[radial-gradient(circle_at_top,_rgba(30,64,175,0.22),_transparent_28%),linear-gradient(180deg,#020617_0%,#020817_100%)] px-6 text-slate-100">
-      <div className="w-full max-w-[420px] rounded-[36px] border border-white/10 bg-slate-950/72 px-8 py-9 text-center shadow-[0_28px_90px_rgba(2,6,23,0.55)] backdrop-blur">
+    <div className="relative flex min-h-screen items-center justify-center bg-[radial-gradient(circle_at_top,_rgba(30,64,175,0.22),_transparent_28%),linear-gradient(180deg,#020617_0%,#020817_100%)] px-6 text-slate-100">
+      <button
+        type="button"
+        onClick={onToggleLogs}
+        title={logOpen ? 'Ocultar logs de inicializacao' : 'Abrir logs de inicializacao'}
+        className="absolute right-5 top-5 z-20 inline-flex size-11 items-center justify-center rounded-2xl border border-white/10 bg-slate-950/76 text-slate-200 shadow-[0_16px_40px_rgba(2,6,23,0.4)] backdrop-blur transition hover:border-cyan-300/40 hover:bg-cyan-400/10 hover:text-cyan-50"
+        aria-label="Alternar logs de inicializacao"
+      >
+        <Logs className="size-4" />
+      </button>
+
+      {logOpen ? (
+        <div className="pointer-events-none fixed inset-x-4 bottom-5 z-20 flex justify-end">
+          <div className="pointer-events-auto w-full max-w-[560px] overflow-hidden rounded-[28px] border border-white/10 bg-slate-950/94 shadow-[0_28px_90px_rgba(2,6,23,0.6)] backdrop-blur">
+            <div className="flex items-center justify-between border-b border-white/8 px-4 py-3">
+              <div>
+                <p className="text-xs uppercase tracking-[0.18em] text-cyan-200/70">Inicializacao</p>
+                <p className="mt-1 text-sm font-medium text-white">Logs de conexao com o backend</p>
+              </div>
+              <button
+                type="button"
+                onClick={onToggleLogs}
+                className="inline-flex size-9 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04] text-slate-200 transition hover:border-cyan-300/40 hover:bg-cyan-400/10 hover:text-cyan-50"
+                aria-label="Fechar logs de inicializacao"
+              >
+                <X className="size-4" />
+              </button>
+            </div>
+            <div className="max-h-[280px] overflow-auto px-4 py-3 font-mono text-[12px] leading-6 text-slate-300">
+              {visibleLogs.length === 0 ? <p className="text-slate-500">Nenhuma linha registrada ainda.</p> : visibleLogs.map((line, index) => <div key={`${index}-${line}`}>{line}</div>)}
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="w-full max-w-[440px] rounded-[36px] border border-white/10 bg-slate-950/72 px-8 py-9 text-center shadow-[0_28px_90px_rgba(2,6,23,0.55)] backdrop-blur">
         <div className="mx-auto flex size-16 items-center justify-center overflow-hidden rounded-[22px] border border-cyan-300/30 bg-cyan-400/10 shadow-[0_0_40px_rgba(34,211,238,0.14)]">
           <img src={`${import.meta.env.BASE_URL}app-icon.png`} alt="" className="size-full object-contain p-2" />
         </div>
@@ -1401,15 +1776,10 @@ function LoadingScreen({ message = 'Preparando a aplicacao...' }: LoadingScreenP
         </div>
         <p className="mt-8 text-sm font-medium uppercase tracking-[0.22em] text-cyan-200/70">Inicializando</p>
         <p className="mt-3 text-base leading-7 text-slate-300">{message}</p>
+        <p className="mt-3 text-sm leading-6 text-slate-500">A janela libera assim que o backend nativo terminar o handshake inicial.</p>
       </div>
     </div>
   )
-}
-
-type SidebarCardProps = {
-  icon: ReactNode
-  title: string
-  children: ReactNode
 }
 
 function SidebarCard({ icon, title, children }: SidebarCardProps) {
@@ -1477,9 +1847,11 @@ function StatCard({ label, value }: { label: string; value: string }) {
 
 function InfoPill({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-[28px] border border-white/10 bg-white/[0.04] px-4 py-4 text-sm text-slate-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
-      <p className="text-xs uppercase tracking-[0.18em] text-slate-500">{label}</p>
-      <p className="mt-2 text-sm font-medium leading-6 text-white">{value}</p>
+    <div className="rounded-[28px] border border-white/10 bg-white/[0.04] px-5 py-4 text-slate-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]">
+      <div className="flex h-full min-h-[92px] flex-col justify-between gap-3">
+        <p className="text-xs uppercase tracking-[0.18em] text-slate-500">{label}</p>
+        <p className="text-base font-semibold leading-7 text-white sm:text-lg">{value}</p>
+      </div>
     </div>
   )
 }
@@ -1524,6 +1896,7 @@ function CheckboxShell({ checked, label, onCheckedChange }: { checked: CheckedSt
       onCheckedChange={onCheckedChange}
       aria-label={label}
       onClick={(event) => event.stopPropagation()}
+      onDoubleClick={(event) => event.stopPropagation()}
       className="flex size-10 shrink-0 items-center justify-center rounded-2xl border border-white/10 bg-slate-950/85 text-cyan-100 transition hover:border-cyan-300/50 hover:bg-cyan-400/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/70 data-[state=checked]:border-cyan-300/50 data-[state=checked]:bg-cyan-400/15 data-[state=indeterminate]:border-cyan-300/50 data-[state=indeterminate]:bg-cyan-400/15"
     >
       <Checkbox.Indicator>
@@ -1534,18 +1907,55 @@ function CheckboxShell({ checked, label, onCheckedChange }: { checked: CheckedSt
 }
 
 function RangePicker({ value, onChange }: { value: DateRange | undefined; onChange: (next: DateRange | undefined) => void }) {
+  const [open, setOpen] = useState(false)
+  const [hoveredDay, setHoveredDay] = useState<Date | undefined>()
+
+  const awaitingEndDate = Boolean(value?.from && !value?.to)
+  const previewRange = useMemo(() => {
+    if (!value?.from || value.to || !hoveredDay) {
+      return undefined
+    }
+
+    return hoveredDay.getTime() < value.from.getTime()
+      ? { from: hoveredDay, to: value.from }
+      : { from: value.from, to: hoveredDay }
+  }, [hoveredDay, value])
+
+  const helperText = awaitingEndDate
+    ? 'Selecione a data final do intervalo.'
+    : value?.from && value?.to
+      ? 'Intervalo definido. Clique em uma nova data para recomecar a selecao.'
+      : 'Selecione a data inicial do intervalo.'
+
+  const handleSelect = (next: DateRange | undefined) => {
+    onChange(next)
+    setHoveredDay(undefined)
+
+    if (next?.from && next?.to) {
+      window.setTimeout(() => setOpen(false), 0)
+    }
+  }
+
   return (
-    <Popover.Root>
+    <Popover.Root
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next)
+        if (!next) {
+          setHoveredDay(undefined)
+        }
+      }}
+    >
       <Popover.Trigger asChild>
         <button
           type="button"
           className="flex w-full items-center justify-between gap-3 rounded-2xl border border-white/10 bg-slate-900/80 px-4 py-3 text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.03)] transition hover:border-cyan-300/35 hover:bg-slate-900"
         >
           <div>
-            <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Periodo selecionado</p>
+            <p className="text-xs uppercase tracking-[0.18em] text-slate-500">{awaitingEndDate ? 'Selecionando data final' : 'Periodo selecionado'}</p>
             <p className="mt-1 text-sm font-medium text-white">{formatRange(value)}</p>
           </div>
-          <CalendarRange className="size-4 text-cyan-200" />
+          <CalendarDays className="size-4 text-cyan-200" />
         </button>
       </Popover.Trigger>
       <Popover.Portal>
@@ -1553,16 +1963,38 @@ function RangePicker({ value, onChange }: { value: DateRange | undefined; onChan
           side="bottom"
           align="start"
           sideOffset={12}
-          className="z-50 w-[min(92vw,340px)] rounded-[28px] border border-white/10 bg-slate-950/95 p-4 shadow-[0_30px_80px_rgba(2,6,23,0.8)] backdrop-blur"
+          onMouseLeave={() => setHoveredDay(undefined)}
+          className="z-50 w-[min(92vw,348px)] rounded-[28px] border border-white/10 bg-slate-950/95 p-4 shadow-[0_30px_80px_rgba(2,6,23,0.8)] backdrop-blur"
         >
+          <div className="mb-4 rounded-[22px] border border-white/10 bg-white/[0.04] px-4 py-3">
+            <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Selecao do intervalo</p>
+            <p className="mt-2 text-sm font-medium text-white">{formatRange(value)}</p>
+            <p className="mt-2 text-xs leading-5 text-cyan-100/75">{helperText}</p>
+          </div>
           <DayPicker
             mode="range"
+            resetOnSelect
             locale={ptBR}
             selected={value}
-            onSelect={onChange}
+            onSelect={handleSelect}
+            onDayMouseEnter={(day) => {
+              if (value?.from && !value?.to) {
+                setHoveredDay(day)
+              }
+            }}
             showOutsideDays
             fixedWeeks
             className="w-full"
+            modifiers={{
+              preview: previewRange,
+              preview_start: previewRange?.from,
+              preview_end: previewRange?.to,
+            }}
+            modifiersClassNames={{
+              preview: 'rdp-preview-range',
+              preview_start: 'rdp-preview-start',
+              preview_end: 'rdp-preview-end',
+            }}
             classNames={{
               months: 'flex flex-col gap-4',
               month: 'space-y-4',
@@ -1574,20 +2006,18 @@ function RangePicker({ value, onChange }: { value: DateRange | undefined; onChan
               button_next:
                 'inline-flex size-9 items-center justify-center rounded-xl border border-white/10 bg-white/[0.04] text-slate-200 transition hover:border-cyan-300/35 hover:bg-cyan-400/10',
               month_grid: 'w-full border-collapse',
-              weekdays: 'grid grid-cols-7 gap-1 text-xs uppercase tracking-[0.18em] text-slate-500',
+              weekdays: 'grid grid-cols-7 gap-x-0 gap-y-1 text-xs uppercase tracking-[0.18em] text-slate-500',
               weekday: 'flex h-9 items-center justify-center font-medium',
-              week: 'mt-1 grid grid-cols-7 gap-1',
-              day: 'contents',
+              week: 'mt-1 grid grid-cols-7 gap-x-0 gap-y-1',
+              day: 'rdp-day-shell flex items-center justify-center py-0.5',
               day_button:
-                'flex h-11 w-full items-center justify-center rounded-2xl border border-transparent text-sm text-slate-200 transition hover:border-cyan-300/35 hover:bg-cyan-400/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/70',
+                'rdp-day-chip flex h-11 w-full items-center justify-center rounded-full border border-transparent text-sm text-slate-200 transition hover:border-cyan-300/35 hover:bg-cyan-400/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-300/70',
               selected:
-                'rounded-2xl border border-cyan-300/40 bg-cyan-400/20 text-white hover:border-cyan-200/60 hover:bg-cyan-300/25',
-              range_start:
-                'rounded-2xl border border-cyan-200/60 bg-cyan-300/25 text-white shadow-[0_0_0_1px_rgba(255,255,255,0.04)]',
-              range_end:
-                'rounded-2xl border border-cyan-200/60 bg-cyan-300/25 text-white shadow-[0_0_0_1px_rgba(255,255,255,0.04)]',
-              range_middle: 'rounded-2xl bg-cyan-400/10 text-cyan-50',
-              today: 'border border-white/10 bg-white/[0.04] text-white',
+                'text-white hover:border-cyan-200/60 hover:bg-cyan-300/25',
+              range_start: 'rdp-range-start-shell text-white',
+              range_end: 'rdp-range-end-shell text-white',
+              range_middle: 'rdp-range-middle-shell text-cyan-50',
+              today: 'text-white',
               outside: 'text-slate-600',
               disabled: 'text-slate-700',
             }}
@@ -1841,6 +2271,56 @@ function formatLastSearchRange(range: DateRange | null) {
   return formatRange(range)
 }
 
+function findXmlSearchMatches(source: string, query: string) {
+  if (!query) {
+    return []
+  }
+
+  const normalizedSource = source.toLocaleLowerCase()
+  const normalizedQuery = query.toLocaleLowerCase()
+  const matches: Array<{ start: number; end: number }> = []
+  let searchIndex = 0
+
+  while (searchIndex < normalizedSource.length) {
+    const matchIndex = normalizedSource.indexOf(normalizedQuery, searchIndex)
+    if (matchIndex === -1) {
+      break
+    }
+
+    matches.push({ start: matchIndex, end: matchIndex + normalizedQuery.length })
+    searchIndex = matchIndex + normalizedQuery.length
+  }
+
+  return matches
+}
+
+function buildHighlightedXml(source: string, matches: Array<{ start: number; end: number }>): XmlHighlightPart[] {
+  if (matches.length === 0) {
+    return [{ text: source, matchIndex: null }]
+  }
+
+  const parts: XmlHighlightPart[] = []
+  let cursor = 0
+
+  matches.forEach((match, index) => {
+    if (match.start > cursor) {
+      parts.push({ text: source.slice(cursor, match.start), matchIndex: null })
+    }
+
+    parts.push({
+      text: source.slice(match.start, match.end),
+      matchIndex: index,
+    })
+    cursor = match.end
+  })
+
+  if (cursor < source.length) {
+    parts.push({ text: source.slice(cursor), matchIndex: null })
+  }
+
+  return parts
+}
+
 function formatIsoDate(value: Date) {
   return format(value, 'yyyy-MM-dd')
 }
@@ -1923,6 +2403,24 @@ function deriveCheckedState(ids: string[], selected: Set<string>): CheckedState 
   return 'indeterminate'
 }
 
+function resizeAdjacentColumns(weights: Record<NoteColumnKey, number>, columnKey: NoteColumnKey, nextColumnKey: NoteColumnKey, deltaWeight: number) {
+  const maxPositiveDelta = Math.min(
+    NOTE_COLUMN_MAX_WEIGHTS[columnKey] - weights[columnKey],
+    weights[nextColumnKey] - NOTE_COLUMN_MIN_WEIGHTS[nextColumnKey],
+  )
+  const maxNegativeDelta = Math.max(
+    NOTE_COLUMN_MIN_WEIGHTS[columnKey] - weights[columnKey],
+    weights[nextColumnKey] - NOTE_COLUMN_MAX_WEIGHTS[nextColumnKey],
+  )
+  const safeDelta = clamp(deltaWeight, maxNegativeDelta, maxPositiveDelta)
+
+  return {
+    ...weights,
+    [columnKey]: clamp(weights[columnKey] + safeDelta, NOTE_COLUMN_MIN_WEIGHTS[columnKey], NOTE_COLUMN_MAX_WEIGHTS[columnKey]),
+    [nextColumnKey]: clamp(weights[nextColumnKey] - safeDelta, NOTE_COLUMN_MIN_WEIGHTS[nextColumnKey], NOTE_COLUMN_MAX_WEIGHTS[nextColumnKey]),
+  }
+}
+
 function addSetValue(current: Set<string>, id: string) {
   const next = new Set(current)
   next.add(id)
@@ -1944,6 +2442,17 @@ function clamp(value: number, min: number, max: number) {
 }
 
 export default App
+
+
+
+
+
+
+
+
+
+
+
 
 
 

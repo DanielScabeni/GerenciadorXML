@@ -843,8 +843,20 @@ def build_default_zip_name(start_date: date, end_date: date) -> str:
 def format_xml_preview(source: Path) -> str:
     try:
         tree = ET.parse(source)
-        ET.indent(tree, space="  ")
         root = tree.getroot()
+        for element in root.iter():
+            if isinstance(element.tag, str) and element.tag.startswith("{"):
+                element.tag = element.tag.split("}", 1)[1]
+
+            if element.attrib:
+                normalized_attributes = {}
+                for key, value in element.attrib.items():
+                    normalized_key = key.split("}", 1)[1] if key.startswith("{") else key
+                    normalized_attributes[normalized_key] = value
+                element.attrib.clear()
+                element.attrib.update(normalized_attributes)
+
+        ET.indent(tree, space="  ")
         return ET.tostring(root, encoding="unicode")
     except ET.ParseError:
         for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
@@ -905,10 +917,6 @@ class XmlAppService:
         saved_path = self.config_data.get("base_path", "").strip()
         normalized_saved_path = str(resolve_base_path(saved_path)) if saved_path else ""
 
-        validation = None
-        if normalized_saved_path:
-            validation = self.test_structure(normalized_saved_path, persist=False)
-
         startup = self._build_startup_payload(normalized_saved_path)
         return {
             "ok": True,
@@ -917,7 +925,7 @@ class XmlAppService:
                 "hasSavedPath": bool(normalized_saved_path),
             },
             "startup": startup,
-            "validation": validation,
+            "validation": None,
             "lastSearch": self._last_search_payload(),
         }
 
